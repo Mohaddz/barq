@@ -1,0 +1,66 @@
+# Run commands from the repository root. Dataset revisions are immutable pins.
+seed: 42
+validation_fraction: 0.02
+audit_rows: 100
+sample_per_group: 3
+batch_size: 1000
+
+datasets:
+  - name: mix
+    repo_id: Mohaddz/arabic-sft-mix-2
+    revision: c1e0faed50f0e68bd66344cd1e0754a05140be8b
+    config: default
+    adapter: mix
+    preserve_splits: false
+    splits:
+      train: 2371371
+    unlabeled_splits: []
+    expected_sources:
+      - arabic_aya_arb
+      - arabic_aya_ars
+      - arabic_aya_acq
+      - hala
+      - dialect_to_msa
+      - news_commentary
+      - grammar_corrections
+      - diacritization
+      - twitter_sentiment
+      - palm_ara
+      - palm
+
+  - name: aisa
+    repo_id: TuwaiqAcademy/AISA-ArabicFC
+    revision: 06d4d80e255f3fb99c1554d70aed0e474a61866c
+    config: default
+    adapter: aisa
+    preserve_splits: true
+    splits:
+      train: 10550
+      dev: 545
+      test: 1125
+    # Public test rows have no gold answer; preserve as holdout inputs.
+    unlabeled_splits:
+      - test
+
+# null = NOT CHECKED. A non-null missing file fails the run.
+# Files are UTF-8 JSONL: {"prompt": "...", "variants": ["..."]}.
+# Paths are relative to this config's directory, e.g.
+# ../data/benchmarks/arabicmmlu.jsonl. Record version/provenance with each file.
+# Checks use NFC + whitespace-normalized exact keys, not fuzzy/translated matching.
+benchmarks:
+  - name: BALSAM v2
+    path: null
+  - name: AlGhafa
+    path: null
+  - name: ArabicMMLU
+    path: null
+  - name: Arabic EXAMS
+    path: null
+  - name: MadinahQA
+    path: null
+  - name: AraTrust
+    path: null
+  - name: ALRAGE
+    path: null
+  - name: Translated MMLU
+    path: null

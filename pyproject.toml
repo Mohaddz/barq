@@ -1,0 +1,22 @@
+[project]
+name = "barq"
+version = "0.1.0"
+description = "A small, reproducible Arabic SFT data preparation pipeline"
+readme = "README.md"
+authors = [
+    { name = "Mohaddz", email = "93622996+Mohaddz@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=5.0.1",
+    "huggingface-hub>=1.30.0",
+    "pyarrow>=25.0.1",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+barq = "barq.data:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
