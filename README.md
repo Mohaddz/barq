@@ -132,7 +132,7 @@ After completion, `latest.json` identifies the saved stage runs and report paths
 
 `barq quality` uses a small existing review or curation `review_samples.jsonl` file. It does not download datasets or scan the full prepared corpus. `configs/quality.yaml` contains the OpenRouter model (`meta/muse-spark-1.3-contributor`), task rubrics, four concurrent requests, a 1,000-row default, and a **$5 inference budget per output directory**. It adds no Python dependencies.
 
-The configured price ceilings are $0.10/M input tokens and $0.20/M output tokens, checked against the live catalogue before execution. Muse requires reasoning; this pilot uses `medium` and counts reasoning against the completion limit and budget. The [Contributor model](https://openrouter.ai/meta/muse-spark-1.3-contributor) allows Meta to use submitted inputs and outputs to improve its products. Lower price does not establish Arabic judging quality.
+The configured price ceilings are $0.10/M input tokens and $0.20/M output tokens, checked against the live catalogue before execution. Muse requires reasoning; this pilot uses `medium` with an 8,192-token completion ceiling, including reasoning. Some harder pilot examples exhausted 4,096 tokens, so the higher ceiling leaves room for the final JSON; only generated tokens are billed. The [Contributor model](https://openrouter.ai/meta/muse-spark-1.3-contributor) allows Meta to use submitted inputs and outputs to improve its products. Lower price does not establish Arabic judging quality.
 
 Start with an offline preview, using the paths to your existing sample and optional reference assessments:
 
