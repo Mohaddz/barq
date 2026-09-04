@@ -6,6 +6,7 @@ properties. Other JSON Schema constraints are left to a full schema validator.
 """
 
 import ast
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -385,3 +386,226 @@ def review_checks(messages: list[dict], tools: list[dict], source: str, task: st
                 ):
                     flags.append("python_function_missing")
     return {"flags": flags, "checks": checks, "task_hint": hint}
+
+
+_AISA_NO_CALL = "هذا السؤال لا يتطلب استدعاء أي أداة."
+_NUMBER_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])[+-]?(?:\d{1,3}(?:[,٬]\d{3})+|\d+)"
+    r"(?:[.٫]\d+)?(?:[eE][+-]?\d+)?(?![A-Za-z0-9])"
+)
+_IDENTIFIER_FIELD = re.compile(r"(?:^|_)(?:id|iban|passport|iqama|visa|insurance|border|plate)(?:_|$)", re.I)
+_DATE_FIELD = re.compile(r"(?:^|_)(?:date|datetime|check_in|check_out)(?:_|$)", re.I)
+_TRANSFORM_PREFIXES = {
+    "summarization": ("لخّص النص التالي بشكل موجز:\n\n", "تلخيص المقال:"),
+    "dialect_translation": ("ترجم النص التالي إلى اللغة العربية الفصحى:\n\n",),
+    "grammar_correction": ("صحّح الأخطاء النحوية في النص التالي:\n\n",),
+}
+_LITERAL_CONSTRAINT = re.compile(
+    r"(?P<action>ابدأ|اختم) (?:الإجابة|الرد|القصة|النص) حرفي(?:ًا|ا) "
+    r"بـ?\s*«(?P<literal>[^»\n]{1,200})»\.?"
+)
+
+
+class _NumericTokenLimit(ValueError):
+    """Numeric text exceeds the deliberately bounded lexical comparison scope."""
+
+
+def _strings(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _strings(child)
+
+
+def _decimal_digits(text: str) -> str:
+    # Comparison keys only: no Arabic letter, mark, dialect or input normalization.
+    return "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in text)
+
+
+def _numeric_tokens(text: str) -> set[Decimal]:
+    tokens = set()
+    for match in _NUMBER_TOKEN.finditer(_decimal_digits(text)):
+        token = match.group().replace(",", "").replace("٬", "").replace("٫", ".")
+        exponent = re.search(r"[eE]([+-]?\d+)$", token)
+        if len(token) > 256 or exponent and (
+            len(exponent[1].lstrip("+-")) > 5 or abs(int(exponent[1])) > 10_000
+        ):
+            raise _NumericTokenLimit
+        try:
+            number = Decimal(token)
+            if not number.is_finite():
+                raise _NumericTokenLimit
+            tokens.add(number)
+        except (InvalidOperation, OverflowError) as error:
+            raise _NumericTokenLimit from error
+    return tokens
+
+
+def _argument_leaves(value: object, schema: object, key: str = ""):
+    schema = schema if isinstance(schema, dict) else {}
+    if (not isinstance(value, (dict, list)) and "default" in schema and value == schema["default"]
+            and isinstance(value, bool) == isinstance(schema["default"], bool)):
+        return
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        for name, child in value.items():
+            yield from _argument_leaves(child, properties.get(name, {}), name)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _argument_leaves(child, schema.get("items", {}), key)
+    else:
+        yield key, value
+
+
+def _argument_unverified(key: str, value: object, context: str, numbers: set[Decimal]) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int):
+        if value.bit_length() > 850:  # At most approximately 256 decimal digits.
+            raise _NumericTokenLimit
+        return Decimal(value) not in numbers
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _NumericTokenLimit
+        return Decimal(str(value)) not in numbers
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = _decimal_digits(value).strip()
+    if _IDENTIFIER_FIELD.search(key) or _DATE_FIELD.search(key):
+        # Full tokens retain leading zeroes and date order. Relative dates, translations
+        # and calculated dates can legitimately fail this literal check: review only.
+        return re.search(r"(?<![A-Za-z0-9])" + re.escape(text) + r"(?![A-Za-z0-9])", context) is None
+    return bool(_numeric_tokens(text) - numbers)
+
+
+def _transformation_source(prompt: str, task: str) -> str | None:
+    for prefix in _TRANSFORM_PREFIXES.get(task, ()):
+        if prompt.startswith(prefix):
+            return prompt[len(prefix):]
+    if task == "translation":
+        match = re.match(r"ترجم النص التالي من [^:\n]{1,40} إلى العربية:\n\n", prompt)
+        if match:
+            return prompt[match.end():]
+    return None
+
+
+def _creative_constraints(prompt: str, answer: str, flags: list, checks: list):
+    # Only a request line followed entirely by known standalone directives is graded.
+    # Embedded prose, quotations, alternatives and unknown wording remain semantic work.
+    lines = prompt.strip().splitlines()
+    directives = lines[1:]
+    matches = [_LITERAL_CONSTRAINT.fullmatch(line) for line in directives]
+    comma = "لا تستخدم الفواصل العربية أو الإنجليزية."
+    if (not 1 <= len(directives) <= 3 or not _CREATIVE_REQUEST.search(lines[0])
+            or any(match is None and line != comma for line, match in zip(directives, matches))):
+        checks.append("instruction_constraints_skipped_semantic_review")
+        return
+    for line, match in zip(directives, matches):
+        if line == comma:
+            checks.append("forbidden_comma_constraint")
+            if "," in answer or "،" in answer:
+                flags.append("forbidden_comma_present")
+        else:
+            start = match["action"] == "ابدأ"
+            checks.append("literal_start_constraint" if start else "literal_end_constraint")
+            satisfied = (answer.strip().startswith(match["literal"]) if start
+                         else answer.strip().endswith(match["literal"]))
+            if not satisfied:
+                flags.append("literal_start_mismatch" if start else "literal_end_mismatch")
+
+
+def curation_checks(messages: list[dict], tools: list[dict], source: str, task: str) -> dict:
+    """Extend review signals without rewriting data or proving semantic correctness.
+
+    The caller owns structural validation and routing. New flags are review-only:
+    lexical grounding cannot verify arithmetic, written-out quantities, relative dates,
+    entity aliases or tool behavior. Numeric tokens are bounded to 256 characters and
+    exponents with absolute value <= 10,000; parser limits emit skipped review signals.
+    Only earlier non-assistant message contents can
+    ground a call; matching tokens can still occur in an unrelated part of that context.
+    Schema defaults are skipped only on direct equality. Metadata outside messages is
+    unavailable here, and stored reasoning is flagged for presence, not automatically
+    removed or graded. Unsupported transformation/constraint scopes record skipped checks.
+    """
+    result = review_checks(messages, tools, source, task)
+    flags, checks = result["flags"], result["checks"]
+    messages = [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []
+    checks.extend(["message_replacement_character", "assistant_reasoning_fields"])
+    if any("\ufffd" in text for text in _strings(messages)):
+        flags.append("replacement_character_present")
+    if any(m.get("role") == "assistant" and any(
+        isinstance(m.get(key), str) and m[key].strip() for key in ("think", "_think_for_train")
+    ) for m in messages):
+        flags.append("assistant_reasoning_fields_present")
+    users = [m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    prompt = users[-1] if users else ""
+    final = messages[-1] if messages else {}
+    answer = final.get("content") if final.get("role") == "assistant" else None
+    if source == "TuwaiqAcademy/AISA-ArabicFC" and task == "tool_use":
+        checks.append("aisa_no_call_target")
+        if isinstance(answer, str) and answer.strip() == _AISA_NO_CALL and not final.get("tool_calls"):
+            flags.append("aisa_generic_no_call_target")
+
+    schemas = _tool_schemas(tools, [])
+    prior = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            if isinstance(message.get("content"), str):
+                prior.append(message["content"])
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            continue
+        context = _decimal_digits("\n".join(prior))
+        try:
+            numbers = _numeric_tokens(context)
+        except _NumericTokenLimit:
+            flags.append("numeric_token_check_skipped_limit")
+            checks.append("tool_argument_token_grounding_skipped_numeric_limit")
+            continue
+        for call in calls:
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            arguments = function.get("arguments") if isinstance(function, dict) else None
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments, parse_constant=_reject_constant, object_pairs_hook=_unique_object)
+                except (ValueError, RecursionError):
+                    arguments = None
+            if not isinstance(arguments, dict):
+                checks.append("tool_argument_token_grounding_skipped_invalid_arguments")
+                continue
+            name = function.get("name")
+            schema = schemas.get(name, {}) if isinstance(name, str) else {}
+            try:
+                unverified = any(_argument_unverified(key, value, context, numbers)
+                                 for key, value in _argument_leaves(arguments, schema))
+            except _NumericTokenLimit:
+                flags.append("numeric_token_check_skipped_limit")
+                checks.append("tool_argument_token_grounding_skipped_numeric_limit")
+            else:
+                checks.append("tool_argument_token_grounding")
+                if unverified:
+                    flags.append("tool_argument_tokens_unverified")
+
+    if task in {*_TRANSFORM_PREFIXES, "translation"}:
+        text = _transformation_source(prompt, task)
+        if text is None or not isinstance(answer, str):
+            checks.append("transformation_numeric_grounding_skipped_unknown_wrapper")
+        else:
+            try:
+                added = _numeric_tokens(answer) - _numeric_tokens(text)
+            except _NumericTokenLimit:
+                flags.append("numeric_token_check_skipped_limit")
+                checks.append("transformation_numeric_grounding_skipped_numeric_limit")
+            else:
+                checks.append("transformation_numeric_grounding")
+                if added:
+                    flags.append("transformation_numbers_unverified")
+    if result["task_hint"] == "creative_writing" and task != "tool_use" and isinstance(answer, str):
+        _creative_constraints(prompt, answer, flags, checks)
+    return {"flags": list(dict.fromkeys(flags)), "checks": list(dict.fromkeys(checks)),
+            "task_hint": result["task_hint"]}

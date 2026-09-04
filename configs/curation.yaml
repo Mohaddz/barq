@@ -1,0 +1,18 @@
+# Offline routing only. Acceptance is not semantic approval or an SFT export.
+schema_version: 1
+seed: 42
+batch_size: 1000
+sample_per_group: 3
+
+# These narrow output-contract defects need a proposed repair and recheck.
+# Every other signal goes to review; structural invalidity takes precedence.
+repair_flags:
+  - underlying_text_changed
+  - no_diacritics_added
+  - invalid_sentiment_label
+
+# Temporary holds motivated by the sample review, not source-wide error claims.
+review_sources:
+  news_commentary: translation_alignment_pending
+review_tasks:
+  summarization: summary_grounding_pending

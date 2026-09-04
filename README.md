@@ -2,7 +2,7 @@
 
 Phase 0 prepares and audits Arabic chat and tool-use data before training. It uses pinned copies of [arabic-sft-mix-2](https://huggingface.co/datasets/Mohaddz/arabic-sft-mix-2) and [AISA-ArabicFC](https://huggingface.co/datasets/TuwaiqAcademy/AISA-ArabicFC).
 
-No training, RL, model judging, paid API calls or credentials are required. Audit and preparation need internet access to fetch public data. The review stage uses only prepared files already on disk.
+No training, RL, model judging, paid API calls or credentials are required. Audit and preparation need internet access to fetch public data. Review and curation use only prepared files already on disk.
 
 ## Run
 
@@ -81,6 +81,28 @@ Read `reports/review/<run-id>/review.md`, then inspect `review_samples.jsonl` an
 
 This stage does not judge factual correctness with an LLM, rewrite or delete answers, assign an automatic quality score, choose source weights, or produce a final SFT dataset.
 
+## Curate prepared data (Phase 1)
+
+On the VM holding the completed prepare run, update the code and run:
+
+```sh
+git pull --ff-only
+uv sync --locked
+uv run --locked barq curate --input data/processed/prepare/20260904T122021Z-d8a1e6ee
+```
+
+Replace the prepare run ID with your own. Curation reuses its files without network or model calls. It assesses **labeled training candidates only**, assigning `accept`, `review`, `repair` or `exclude` with reasons and check results. `accept` means the row passed the implemented offline checks; it is neither semantic approval nor a final training export. `repair` identifies work needed; this command does not rewrite answers.
+
+The default `configs/curation.yaml` holds News Commentary translations and summaries for semantic alignment review, and generic AISA no-call answers for adaptation. Defective structures are excluded; uncertainty signals go to review, including any flag not explicitly routed by the config. Suspected unsupported numeric tool arguments are review hints, not proof of invention or grounds for automatic exclusion. The strict config controls `seed`, `batch_size`, `sample_per_group`, `repair_flags`, `review_sources` and `review_tasks`; use `--config PATH` to supply another config.
+
+Curation adds checks for replacement characters, stored assistant reasoning, and numeric tokens introduced in supported translation, summary, dialect-conversion and correction tasks. Tool checks compare numeric/date/ID values against preceding non-assistant context. Only narrowly recognized standalone writing directives get literal opening/ending/comma checks; other writing constraints remain semantic review work. Unrecognized task wrappers go to review. Stored `think` fields remain in the original intermediate records and are flagged for a supervision decision; they are not approved training targets.
+
+New outputs are written under `data/processed/curate/<run-id>/`: `candidates.parquet` contains accepted training rows, while `decisions.parquet` records every assessed training candidate, its decision, reasons, checks and source/task/dialect/hint metadata. Original preparation decisions, validation rows and test inputs remain in the original prepare outputs. No source balancing or split changes occur.
+
+Read `reports/curate/<run-id>/curation.md` and `manifest.json` first. `review_samples.jsonl` supplies bounded samples per source/task/hint/dialect/tool-behavior/decision group (three per group by default). Share the report and manifest, then samples if needed. Use `--manifest PATH` for moved inputs, retaining the original prepare run folder's name; `--output PATH` selects an output workspace root.
+
+Full semantic verification, calibrated model judging, benchmark checks, actual repairs and SFT export still come later. Reports and data are ignored by Git and persist only on the storage holding them: retain or back up the VM storage before deleting it.
+
 ## Benchmark references
 
 Every requested benchmark appears in `configs/data.yaml`. A `path: null` means **not checked**. No benchmark is silently downloaded or assumed clean.
@@ -99,20 +121,24 @@ Use the exact intended benchmark version and record its provenance with the refe
 
 ```text
 configs/data.yaml                    # Pinned inputs and processing settings
+configs/curation.yaml                # Offline curation routing and sample settings
 src/barq/data.py                     # Loading, CLI, processing and reports
 src/barq/rules.py                    # Validation, cleaning and fingerprints
 src/barq/review.py                   # Offline review sampling and reports
+src/barq/curate.py                   # Offline training-candidate decisions and exports
 tests/test_rules.py                  # Arabic and tool-preservation checks
 tests/test_data.py                   # Split, benchmark and export integration checks
 tests/test_review.py                # Review sampling and input integrity checks
 tests/test_quality.py               # Task-specific review hints
+tests/test_curate.py                # Offline routing, evaluation isolation and safe failure
+tests/test_curation_rules.py        # Grounding signals and conservative constraint checks
 data/raw/<dataset>/<revision>/       # Cached pinned source files
-data/processed/<mode>/<run-id>/
+data/processed/{audit,prepare}/<run-id>/
   candidates.parquet                # Labeled candidate examples
   decisions.parquet                 # Processing decisions and reasons
   holdout.parquet                   # Unlabeled evaluation inputs
   index.sqlite3                     # Disk-backed duplicate/group index
-reports/<mode>/<run-id>/
+reports/{audit,prepare}/<run-id>/
   audit.md                          # Counts, coverage and limitations
   manifest.json                     # Inputs, settings and reproducibility data
   samples.jsonl                     # Small review samples
@@ -122,6 +148,13 @@ reports/review/<run-id>/
   review_samples.jsonl              # Training examples for manual quality review
   flagged_samples.jsonl             # Targeted diagnostic training examples
   flags.parquet                     # Machine-readable review flags
+data/processed/curate/<run-id>/
+  candidates.parquet                # Accepted training rows; offline checks only
+  decisions.parquet                 # All assessed training rows and routing reasons
+reports/curate/<run-id>/
+  curation.md                       # Decisions, coverage and remaining review work
+  manifest.json                     # Inputs, configuration and run status
+  review_samples.jsonl              # Bounded examples from each decision group
 ```
 
 Run IDs include UTC time and a random suffix. Candidate records retain IDs, source/task/split metadata, original split, revision, row index, labeling status and hashes. Conversations, tools and additional metadata are serialized in `messages_json`, `tools_json` and `metadata_json` columns. These are intermediate data exports; model-specific training rendering comes later.
@@ -136,4 +169,4 @@ uv run --locked python -m unittest discover -s tests -v
 
 ## Later phases
 
-Keep Phase 0 outputs as the input contract. Use the Phase 0.1 samples to calibrate a teacher judge against manual reviews, configure benchmark references, and decide source weights and targeted repairs. Teacher review and generation are future work; DataTrove can be added if near-duplicate detection warrants it. Then add `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons, and `rl.py` and `rewards.py` when the environments and reward checks are ready. No training renderer or RL prompts are generated yet.
+Keep Phase 0 outputs as the input contract. Use review samples and Phase 1 curation decisions to calibrate a teacher judge against manual reviews, configure benchmark references, and decide source weights and targeted repairs. Offline acceptance alone is insufficient for training. Teacher review and generation are future work; DataTrove can be added if near-duplicate detection warrants it. Then add `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons, and `rl.py` and `rewards.py` when the environments and reward checks are ready. No training renderer or RL prompts are generated yet.
