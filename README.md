@@ -103,6 +103,29 @@ Read `reports/curate/<run-id>/curation.md` and `manifest.json` first. `review_sa
 
 Full semantic verification, calibrated model judging, benchmark checks, actual repairs and SFT export still come later. Reports and data are ignored by Git and persist only on the storage holding them: retain or back up the VM storage before deleting it.
 
+## Persistent Modal run
+
+For Modal, launch a background job from your own computer rather than keeping the pipeline in a temporary shell. With the authenticated Modal CLI installed (tested with `1.5.2`), run from the repository root:
+
+```sh
+git pull --ff-only
+modal run --detach scripts/modal_pipeline.py
+```
+
+This optional wrapper requests four CPUs and 16 GiB memory, with a four-hour function timeout. It runs `prepare` and then `curate` on Modal. The full dataset is downloaded there; only source/configuration files are uploaded from your computer. The dependencies come from `uv.lock`; Modal is not added to the core project's dependencies. This launch uses your Modal compute and storage account.
+
+All raw downloads, prepared data, curation outputs, reports and the Hugging Face cache live on the named **`barq-data` Volume**, mounted at `/barq`. Completed stages are explicitly committed. Rerunning the command reuses compatible completed stages; a failed/incomplete stage starts a new run using retained downloads. It does not resume partway through individual rows or recover files from an already-dead shell's unmounted disk.
+
+The local entrypoint uses `.spawn()` and `--detach` so the submitted job can outlive the launching terminal. Wait for the printed submission receipt before closing it. The receipt is saved under `reports/modal-launch/` and includes the app ID and log command. Run one job at a time against this Volume; a function's container limit does not prevent a second separately launched app from writing to it.
+
+```sh
+modal app logs APP_ID -f
+modal volume ls barq-data reports/curate
+modal volume get barq-data latest.json -
+```
+
+After completion, `latest.json` identifies the saved stage runs and report paths. Download individual reports with `modal volume get barq-data reports/curate/RUN_ID/curation.md ./curation.md`. The Volume survives the compute job, but deleting the Volume deletes that retained copy. Commit behavior and detached jobs are described in [Modal Volumes](https://modal.com/docs/guide/volumes) and [invocation durability](https://modal.com/docs/guide/function-invocation-methods).
+
 ## Benchmark references
 
 Every requested benchmark appears in `configs/data.yaml`. A `path: null` means **not checked**. No benchmark is silently downloaded or assumed clean.
@@ -126,6 +149,8 @@ src/barq/data.py                     # Loading, CLI, processing and reports
 src/barq/rules.py                    # Validation, cleaning and fingerprints
 src/barq/review.py                   # Offline review sampling and reports
 src/barq/curate.py                   # Offline training-candidate decisions and exports
+src/barq/persistent.py               # Completed-stage reuse and persistence callbacks
+scripts/modal_pipeline.py            # Optional detached Modal job and named Volume
 tests/test_rules.py                  # Arabic and tool-preservation checks
 tests/test_data.py                   # Split, benchmark and export integration checks
 tests/test_review.py                # Review sampling and input integrity checks
@@ -159,7 +184,7 @@ reports/curate/<run-id>/
 
 Run IDs include UTC time and a random suffix. Candidate records retain IDs, source/task/split metadata, original split, revision, row index, labeling status and hashes. Conversations, tools and additional metadata are serialized in `messages_json`, `tools_json` and `metadata_json` columns. These are intermediate data exports; model-specific training rendering comes later.
 
-Raw data and generated outputs are excluded from Git. Nothing is uploaded or published.
+Raw data and generated outputs are excluded from Git. The local commands do not upload them. The optional Modal runner uploads its source/configuration and writes generated data to your Modal Volume.
 
 ## Verify
 
