@@ -49,6 +49,34 @@ def pipeline():
     return result
 
 
+@app.function(image=image, volumes={"/barq": volume}, cpu=1, memory=2048, timeout=300, retries=0)
+def review_pack():
+    """Build a blind 100-example page using only the small saved review pool."""
+    from barq.review_pack import build
+
+    volume.reload()
+    root = Path("/barq")
+    source = root / "reports/quality-inputs/20260905/review_samples.jsonl"
+    # Required history fails closed if a retained pilot archive is missing.
+    required = [root / "reports/quality/luna-pilot-20260905-v4.tar.gz",
+                root / "reports/quality/muse-tightened-20260905.tar.gz",
+                root / "reports/quality-inputs/20260905/calibration.jsonl"]
+    if not source.is_file() or any(not path.is_file() for path in required):
+        raise ValueError("Saved review pool or prior pilot history is missing from barq-data.")
+    exclusions = sorted(set(required + list((root / "reports/quality").glob("*.tar.gz"))
+                            + list((root / "reports/quality").rglob("sample.jsonl"))
+                            + list((root / "reports/review-packs").glob("*/examples.jsonl"))))
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    output = root / "reports/review-packs" / run_id
+    manifest = build(source, exclusions, output)
+    volume.commit()
+    result = {"status": manifest["status"], "pack_id": manifest["pack_id"], "rows": manifest["rows"],
+              "volume": VOLUME_NAME, "path": str(output.relative_to(root)),
+              "page": str((output / "review.html").relative_to(root))}
+    print(json.dumps(result, indent=2), flush=True)
+    return result
+
+
 @app.function(image=image, volumes={"/barq": volume}, cpu=1, memory=1024, timeout=180)
 def check():
     """Verify image imports and persistent storage without fetching any datasets."""

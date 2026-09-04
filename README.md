@@ -128,6 +128,37 @@ modal volume get barq-data latest.json -
 
 After completion, `latest.json` identifies the saved stage runs and report paths. Download individual reports with `modal volume get barq-data reports/curate/RUN_ID/curation.md ./curation.md`. The Volume survives the compute job, but deleting the Volume deletes that retained copy. Commit behavior and detached jobs are described in [Modal Volumes](https://modal.com/docs/guide/volumes) and [invocation durability](https://modal.com/docs/guide/function-invocation-methods).
 
+## Blind human review pack
+
+Generate 100 fresh examples from the small review pool already retained on `barq-data`:
+
+```sh
+uv run --locked --group modal modal run scripts/modal_pipeline.py::review_pack
+```
+
+This runs on Modal without downloading the full dataset again or calling a model. It requires the saved September 5 review pool, calibration file and both retained pilot archives. Missing history stops the job. Previous pilot/pack IDs, example hashes and input hashes are excluded; remaining prompt duplicates count once. Sampling balances existing source/task/hint/dialect groups, not corpus prevalence. It does not prove semantic-family separation or benchmark cleanliness. Each new invocation creates a different pack and excludes earlier packs; reuse your existing page to continue reviewing.
+
+The command prints `reports/review-packs/RUN_ID`. Download individual files (create the local directory first):
+
+```sh
+mkdir -p reports/review-packs/RUN_ID
+uv run --locked --group modal modal volume get barq-data reports/review-packs/RUN_ID/review.html reports/review-packs/RUN_ID/review.html
+uv run --locked --group modal modal volume get barq-data reports/review-packs/RUN_ID/examples.jsonl reports/review-packs/RUN_ID/examples.jsonl
+uv run --locked --group modal modal volume get barq-data reports/review-packs/RUN_ID/manifest.json reports/review-packs/RUN_ID/manifest.json
+```
+
+Open `review.html` in a browser. It works offline, presents ten examples at a time, and omits model verdicts, routing hints and stored reasoning. Choose **Usable / Flawed / Unsure**, with optional notes. Inspect available tool definitions when reviewing calls. Browser storage saves progress where supported; **export after each session**. Import that JSONL to continue elsewhere. If the browser blocks downloads, Export also displays copyable JSONL that can be saved as a text file. The HTML itself does not contain your saved labels, so moving it alone does not transfer progress.
+
+Once all examples are reviewed, freeze your export **before** running Muse. These commands operate only on the small pack:
+
+```sh
+uv run --locked python -m barq.review_pack freeze --pack reports/review-packs/RUN_ID --labels /path/to/export.jsonl
+uv run --locked barq quality --input reports/review-packs/RUN_ID/examples.jsonl --output reports/quality/human-pack-RUN_ID --execute
+uv run --locked python -m barq.review_pack compare --pack reports/review-packs/RUN_ID --judgments reports/quality/human-pack-RUN_ID/judgments.jsonl
+```
+
+The judge command requires `OPENROUTER_API_KEY` and uses the existing configured budget. Do not pass the browser export as `barq quality --labels`; its three-way human labels use the separate comparison command. Frozen labels cannot be silently overwritten, and comparison rejects changed hashes or mismatched examples. `comparison.md` and `comparisons.jsonl` show agreement and disagreements by task. Repair/drop both map to human "Flawed"; "Unsure" and failed model responses remain distinct. No answers are rewritten or removed. Use fresh examples to test any subsequent rubric changes.
+
 ## Quality judge pilot
 
 `barq quality` uses a small existing review or curation `review_samples.jsonl` file. It does not download datasets or scan the full prepared corpus. `configs/quality.yaml` contains the OpenRouter model (`meta/muse-spark-1.3-contributor`), task rubrics, four concurrent requests, a 1,000-row default, and a **$5 inference budget per output directory**. It adds no Python dependencies.
