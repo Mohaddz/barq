@@ -1,4 +1,4 @@
-"""Run with: modal run --detach scripts/modal_pipeline.py
+"""Run with: uv run --locked --group modal modal run --detach scripts/modal_pipeline.py
 
 Only source/configuration files are uploaded. Datasets are fetched on Modal.
 Run one job at a time against this named Volume.
@@ -18,10 +18,12 @@ app = modal.App("barq-data-pipeline")
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True, version=1)
 
 # uv_sync uploads only pyproject.toml/uv.lock and installs their dependencies.
+# Match the lockfile registry rather than the older builder's ambient package mirror.
 # Explicit source paths keep data/, reports/, .git/ and credentials out of the image.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .uv_sync(str(REPO), frozen=False, uv_version="0.12.1", extra_options="--locked --no-dev")
+    .uv_sync(str(REPO), groups=["modal"], frozen=False, uv_version="0.12.1",
+             extra_options="--locked --no-dev --default-index https://pypi.org/simple")
     .add_local_file(REPO / "pyproject.toml", "/app/pyproject.toml", copy=True)
     .add_local_file(REPO / "README.md", "/app/README.md", copy=True)
     .add_local_dir(REPO / "src", "/app/src", copy=True, ignore=["**/__pycache__/**", "**/*.pyc"])
@@ -44,6 +46,30 @@ def pipeline():
     volume.reload()
     result = run(Path("/barq"), config_dir=Path("/app/configs"), commit=volume.commit, workers=4)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return result
+
+
+@app.function(image=image, volumes={"/barq": volume}, cpu=1, memory=1024, timeout=180)
+def check():
+    """Verify image imports and persistent storage without fetching any datasets."""
+    from importlib.metadata import version
+    from barq.curate import read_config as read_curation
+    from barq.data import read_config as read_data
+    from barq.persistent import run  # Import the actual orchestration and its dependencies.
+
+    read_data(Path("/app/configs/data.yaml"))
+    read_curation(Path("/app/configs/curation.yaml"))
+    volume.reload()
+    probe = Path("/barq") / (".startup-check-" + uuid4().hex)
+    probe.write_text("barq-volume-ok", encoding="utf-8")
+    volume.commit()
+    volume.reload()
+    assert probe.read_text(encoding="utf-8") == "barq-volume-ok"
+    probe.unlink()
+    volume.commit()
+    result = {"status": "ok", "volume": VOLUME_NAME,
+              "packages": {name: version(name) for name in ("barq", "modal", "datasets", "pyarrow")}}
+    print(json.dumps(result, indent=2), flush=True)
     return result
 
 

@@ -105,14 +105,16 @@ Full semantic verification, calibrated model judging, benchmark checks, actual r
 
 ## Persistent Modal run
 
-For Modal, launch a background job from your own computer rather than keeping the pipeline in a temporary shell. With the authenticated Modal CLI installed (tested with `1.5.2`), run from the repository root:
+For Modal, launch a background job from your own computer rather than keeping the pipeline in a temporary shell. With Modal authentication configured, run from the repository root:
 
 ```sh
 git pull --ff-only
-modal run --detach scripts/modal_pipeline.py
+uv run --locked --group modal modal run --detach scripts/modal_pipeline.py
 ```
 
-This optional wrapper requests four CPUs and 16 GiB memory, with a four-hour function timeout. It runs `prepare` and then `curate` on Modal. The full dataset is downloaded there; only source/configuration files are uploaded from your computer. The dependencies come from `uv.lock`; Modal is not added to the core project's dependencies. This launch uses your Modal compute and storage account.
+This optional wrapper requests four CPUs and 16 GiB memory, with a four-hour function timeout. It runs `prepare` and then `curate` on Modal. The full dataset is downloaded there; only source/configuration files are uploaded from your computer. The optional `modal` dependency group pins SDK `1.5.2` for both client and image, including compatibility with older image builders. Regular local Barq commands do not require that group. This launch uses your Modal compute and storage account.
+
+To check the cloud image and Volume without downloading datasets, run `uv run --locked --group modal modal run scripts/modal_pipeline.py::check`. This imports the pipeline, validates both configurations, and verifies a tiny committed file on the Volume before removing that test file.
 
 All raw downloads, prepared data, curation outputs, reports and the Hugging Face cache live on the named **`barq-data` Volume**, mounted at `/barq`. Completed stages are explicitly committed. Rerunning the command reuses compatible completed stages; a failed/incomplete stage starts a new run using retained downloads. It does not resume partway through individual rows or recover files from an already-dead shell's unmounted disk.
 
