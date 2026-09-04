@@ -2,7 +2,7 @@
 
 Phase 0 prepares and audits Arabic chat and tool-use data before training. It uses pinned copies of [arabic-sft-mix-2](https://huggingface.co/datasets/Mohaddz/arabic-sft-mix-2) and [AISA-ArabicFC](https://huggingface.co/datasets/TuwaiqAcademy/AISA-ArabicFC).
 
-No training, RL, model judging, paid API calls or credentials are required. Internet access is needed to fetch the public data.
+No training, RL, model judging, paid API calls or credentials are required. Audit and preparation need internet access to fetch public data. The review stage uses only prepared files already on disk.
 
 ## Run
 
@@ -57,6 +57,28 @@ AISA's public test split is **unlabeled**. Its empty assistant placeholders are 
 
 Overlap protection covers the selected datasets and inspected rows only. For a combined final preparation, run `prepare` with both datasets, without `--dataset`.
 
+## Review prepared data (Phase 0.1)
+
+After preparation finishes, run this on the machine holding its outputs:
+
+```sh
+uv run --locked barq review --input data/processed/prepare/20260904T122021Z-d8a1e6ee --per-group 100
+```
+
+Replace the run ID with your own. Review reads `candidates.parquet` and `decisions.parquet`, and requires the original prepare manifest to report `"status": "complete"`. It finds that manifest under the corresponding `reports/prepare/<run-id>/` directory. If you moved the files elsewhere, retain the original run folder's name and pass `--manifest PATH` to identify the original manifest; review verifies the run ID. `--output PATH` selects another output workspace root. By default review uses the root containing `reports/prepare/<run-id>/manifest.json`, or the current directory if the manifest was moved outside that layout.
+
+Review scans the existing data without downloading datasets or calling models. It preserves every candidate and split, and selects **training rows only** for manual inspection. Validation and test rows remain held out.
+
+- `--per-group 100` samples up to 100 training examples per source/task/review-hint/dialect/tool-behavior group. AISA groups distinguish calls from no-call answers so rare no-call examples are visible. Simple creative-writing hints help route review; these hints do not replace original task labels.
+- `--flagged-per-group 5` keeps up to five diagnostic examples per source/task/flag in a separate sample. These intentionally selected examples do not estimate a source's overall defect rate.
+- `--seed 42` makes sample selection reproducible for the same inputs and settings.
+
+Checks look for changed underlying letters or absent added diacritics in diacritization tasks, unexpected sentiment labels, Python syntax/function issues when applicable, and visible web boilerplate. Python snippets are parsed, never executed. Flags are review hints: valid syntax does not establish correct code, preserved letters do not establish correct diacritics, and unflagged answers may still be wrong. The report includes check coverage and carries forward the preparation run's benchmark status; review does not add new benchmark checks.
+
+Read `reports/review/<run-id>/review.md`, then inspect `review_samples.jsonl` and `flagged_samples.jsonl`. The report also summarizes source/task coverage and preparation decisions. Share those small files and `manifest.json` for review; the large dataset can stay on the VM. Keep the prepared outputs on retained storage before deleting a VM.
+
+This stage does not judge factual correctness with an LLM, rewrite or delete answers, assign an automatic quality score, choose source weights, or produce a final SFT dataset.
+
 ## Benchmark references
 
 Every requested benchmark appears in `configs/data.yaml`. A `path: null` means **not checked**. No benchmark is silently downloaded or assumed clean.
@@ -77,8 +99,11 @@ Use the exact intended benchmark version and record its provenance with the refe
 configs/data.yaml                    # Pinned inputs and processing settings
 src/barq/data.py                     # Loading, CLI, processing and reports
 src/barq/rules.py                    # Validation, cleaning and fingerprints
+src/barq/review.py                   # Offline review sampling and reports
 tests/test_rules.py                  # Arabic and tool-preservation checks
 tests/test_data.py                   # Split, benchmark and export integration checks
+tests/test_review.py                # Review sampling and input integrity checks
+tests/test_quality.py               # Task-specific review hints
 data/raw/<dataset>/<revision>/       # Cached pinned source files
 data/processed/<mode>/<run-id>/
   candidates.parquet                # Labeled candidate examples
@@ -89,6 +114,12 @@ reports/<mode>/<run-id>/
   audit.md                          # Counts, coverage and limitations
   manifest.json                     # Inputs, settings and reproducibility data
   samples.jsonl                     # Small review samples
+reports/review/<run-id>/
+  review.md                         # Source/task findings and check coverage
+  manifest.json                     # Input provenance, settings and run status
+  review_samples.jsonl              # Training examples for manual quality review
+  flagged_samples.jsonl             # Targeted diagnostic training examples
+  flags.parquet                     # Machine-readable review flags
 ```
 
 Run IDs include UTC time and a random suffix. Candidate records retain IDs, source/task/split metadata, original split, revision, row index, labeling status and hashes. Conversations, tools and additional metadata are serialized in `messages_json`, `tools_json` and `metadata_json` columns. These are intermediate data exports; model-specific training rendering comes later.
@@ -103,4 +134,4 @@ uv run --locked python -m unittest discover -s tests -v
 
 ## Later phases
 
-Keep Phase 0 outputs as the input contract. Add `review.py` for selective teacher review, repair and gap filling (and DataTrove if near-duplicate detection warrants it), then `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons. Add `rl.py` and `rewards.py` only when the environments and reward checks are ready. No training renderer or RL prompts are generated in Phase 0.
+Keep Phase 0 outputs as the input contract. Use the Phase 0.1 samples to calibrate a teacher judge against manual reviews, configure benchmark references, and decide source weights and targeted repairs. Teacher review and generation are future work; DataTrove can be added if near-duplicate detection warrants it. Then add `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons, and `rl.py` and `rewards.py` when the environments and reward checks are ready. No training renderer or RL prompts are generated yet.

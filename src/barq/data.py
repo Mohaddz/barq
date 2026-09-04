@@ -643,7 +643,10 @@ def run(config, config_path, mode, root, limit=None, selected=None, *, workers=1
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    if len(sys.argv) > 1 and sys.argv[1] == "review":
+        from barq.review import main as review_main
+        return review_main(sys.argv[2:])
+    parser = argparse.ArgumentParser(description=__doc__, epilog="For offline quality review: barq review --help")
     parser.add_argument("mode", nargs="?", choices=("audit", "prepare"), default="audit")
     parser.add_argument("--config", type=Path, default=Path("configs/data.yaml"))
     parser.add_argument("--limit", type=int, help="Audit rows per dataset split; never used for prepare")

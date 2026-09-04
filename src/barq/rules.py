@@ -5,9 +5,11 @@ Tool schemas support nested JSON types, required fields, enums, and additional
 properties. Other JSON Schema constraints are left to a full schema validator.
 """
 
+import ast
 import hashlib
 import json
 import math
+import re
 import unicodedata
 
 
@@ -279,3 +281,101 @@ def validate_example(
     ):
         reasons.append("final_message_not_assistant")
     return list(dict.fromkeys(reasons))
+
+
+_VOWELS = re.compile("[\u064b-\u0652\u0670]")
+_DIACRITIZATION_PREFIX = "أضف التشكيل إلى النص التالي:\n\n"
+_SENTIMENT_PREFIX = "ما هو شعور النص التالي؟\n\n"
+_REQUEST_START = r"(?:^|\n)\s*(?:(?:من فضلك|لو سمحت|please|can you|could you)\s*[,،]?\s*)?"
+_PYTHON_REQUEST = re.compile(
+    _REQUEST_START + r"(?:[اأ]كتب|أنشئ|انشئ|برمج)\s+(?:لي\s+)?"
+    r"(?:دالة|وظيفة|برنامج|كود|شيفرة|شفرة)\b|"
+    + _REQUEST_START + r"(?:write|create|implement|build)\s+(?:(?:me|a|an|the)\s+){0,2}"
+    r"(?:python(?:\s*3)?\s+)?(?:function|program|script|code)\b", re.IGNORECASE,
+)
+_CREATIVE_REQUEST = re.compile(
+    _REQUEST_START + r"[اأ]كتب\s+(?:لي\s+)?(?:قصة|قصّة|قصيدة|رواية|حكاية|مشهد)\b|"
+    + _REQUEST_START + r"[اأ]كتب\s+(?:لي\s+)?(?:فقرة|نصا|نصًا)\b[^\n]{0,60}"
+    r"\b(?:ال)?(?:قصة|رواية|قصيدة)\b|"
+    + _REQUEST_START + r"write\s+(?:(?:me|a|an|the)\s+){0,2}(?:story|poem|novel)\b",
+    re.IGNORECASE,
+)
+
+
+def _base_text(text: str) -> str:
+    # Keep hamza/maddah and every other mark; stripping all combining marks is unsafe.
+    return " ".join(_VOWELS.sub("", unicodedata.normalize("NFC", text)).split())
+
+
+def review_checks(messages: list[dict], tools: list[dict], source: str, task: str) -> dict:
+    """Return human-review signals, never filtering, repairing or executing content.
+
+    Checks name the rules applied, for conditional denominators. A *_skipped_* check
+    records an unsupported input; it is not an evaluated example. Python checks only
+    syntax/structure, and sentiment checks only the declared label vocabulary.
+    """
+    flags, checks = [], []
+    messages = messages if isinstance(messages, list) else []
+    users = [m["content"] for m in messages if isinstance(m, dict)
+             and m.get("role") == "user" and isinstance(m.get("content"), str)]
+    prompt = users[-1] if users else ""
+    final = messages[-1] if messages and isinstance(messages[-1], dict) else {}
+    answer = final.get("content") if final.get("role") == "assistant" else None
+    hint = "creative_writing" if _CREATIVE_REQUEST.search(prompt) else None
+    if not isinstance(answer, str):
+        return {"flags": flags, "checks": checks, "task_hint": hint}
+
+    if task == "diacritization":
+        if not prompt.startswith(_DIACRITIZATION_PREFIX):
+            checks.append("diacritization_skipped_unknown_wrapper")
+        else:
+            checks.append("diacritization")
+            text = prompt[len(_DIACRITIZATION_PREFIX):]
+            if _base_text(text) != _base_text(answer):
+                flags.append("underlying_text_changed")
+            has_arabic = any(unicodedata.category(c).startswith("L")
+                             and "ARABIC" in unicodedata.name(c, "") for c in text)
+            if has_arabic and not _VOWELS.search(answer):
+                flags.append("no_diacritics_added")
+
+    if source == "twitter_sentiment" and task == "sentiment_analysis":
+        if not prompt.startswith(_SENTIMENT_PREFIX):
+            checks.append("sentiment_label_skipped_unknown_wrapper")
+        else:
+            checks.append("sentiment_label")
+            if unicodedata.normalize("NFC", answer).strip() not in {"سلبي", "إيجابي", "ايجابي", "محايد"}:
+                flags.append("invalid_sentiment_label")
+
+    if task in {"summarization", "translation"}:
+        checks.append("source_boilerplate")
+        if "مواضيع قد تهمك نهاية" in prompt:
+            flags.append("source_boilerplate")
+
+    if (task != "tool_use" and _PYTHON_REQUEST.search(prompt)
+            and re.search(r"\bpython(?:3)?\b|بايثون|بيثون", prompt, re.I)
+            and not final.get("tool_calls")):
+        blocks = re.findall(r"```[ \t]*(?:python3?|py)[ \t]*\r?\n(.*?)```", answer, re.I | re.S)
+        code = "\n\n".join(blocks) if blocks else answer
+        if len(code) > 100_000:
+            flags.append("python_check_skipped_too_long")
+            checks.append("python_syntax_skipped_too_long")
+        else:
+            try:
+                tree = ast.parse(code)
+            except (MemoryError, RecursionError):
+                flags.append("python_check_skipped_parser_limit")
+                checks.append("python_syntax_skipped_parser_limit")
+            except (SyntaxError, ValueError):
+                checks.append("python_syntax")
+                flags.append("python_syntax_invalid")
+            else:
+                checks.append("python_syntax")
+                meaningful = [node for node in tree.body if not isinstance(node, ast.Pass)
+                              and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
+                if not meaningful:
+                    flags.append("python_code_empty")
+                elif re.search(r"\bfunction\b|دالة|وظيفة", prompt, re.I) and not any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(tree)
+                ):
+                    flags.append("python_function_missing")
+    return {"flags": flags, "checks": checks, "task_hint": hint}
