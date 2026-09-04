@@ -130,7 +130,9 @@ After completion, `latest.json` identifies the saved stage runs and report paths
 
 ## Quality judge pilot
 
-`barq quality` uses a small existing review or curation `review_samples.jsonl` file. It does not download datasets or scan the full prepared corpus. `configs/quality.yaml` contains the OpenRouter model (`openai/gpt-5.6-luna`), task rubrics, four concurrent requests, a 1,000-row default, and a **$5 inference budget per output directory**. It adds no Python dependencies.
+`barq quality` uses a small existing review or curation `review_samples.jsonl` file. It does not download datasets or scan the full prepared corpus. `configs/quality.yaml` contains the OpenRouter model (`meta/muse-spark-1.3-contributor`), task rubrics, four concurrent requests, a 1,000-row default, and a **$5 inference budget per output directory**. It adds no Python dependencies.
+
+The configured price ceilings are $0.10/M input tokens and $0.20/M output tokens, checked against the live catalogue before execution. Muse requires reasoning; this pilot uses `medium` and counts reasoning against the completion limit and budget. The [Contributor model](https://openrouter.ai/meta/muse-spark-1.3-contributor) allows Meta to use submitted inputs and outputs to improve its products. Lower price does not establish Arabic judging quality.
 
 Start with an offline preview, using the paths to your existing sample and optional reference assessments:
 
@@ -138,7 +140,7 @@ Start with an offline preview, using the paths to your existing sample and optio
 uv run --locked barq quality \
   --input reports/review/RUN_ID/review_samples.jsonl \
   --labels reports/assessment/RUN_ID/calibration.jsonl \
-  --output reports/quality/luna-pilot
+  --output reports/quality/muse-pilot
 ```
 
 Omit `--labels` when you have no reference file. Sample files and assessments are ignored by Git, so a clone needs its own copy; transfer only these small files or generate a review sample on the machine holding the prepared data. Reference examples are selected first, then remaining slots are filled across source/task/hint/dialect/tool-call and flagged/unflagged groups. Only labeled training rows are eligible. Selection quotas do not estimate corpus quality or final training weights.
@@ -159,19 +161,19 @@ Set `OPENROUTER_API_KEY` through your environment. In Bash, `read -rsp 'OpenRout
 uv run --locked barq quality \
   --input reports/review/RUN_ID/review_samples.jsonl \
   --labels reports/assessment/RUN_ID/calibration.jsonl \
-  --output reports/quality/luna-pilot --execute --max-new-requests 3
+  --output reports/quality/muse-pilot --execute --max-new-requests 3
 ```
 
-Every billable request reserves a conservative maximum cost in `state.sqlite3` **before** dispatch. Successful responses replace that reservation with OpenRouter's reported `usage.cost`, including reasoning. Price ceilings and output token limits are sent to OpenRouter. The cap excludes credit-purchase fees and unrelated account usage; each different output directory has a separate budget. Uncertain requests keep their reservation and are never automatically resent. Errors stop new dispatch; inspect the report before proceeding. Existing successful judgments are reused when rerunning the same input, configuration, references and implementation. Changed inputs or rubrics require a new output directory and a newly budgeted run.
+Every billable request reserves a conservative estimated cost in `state.sqlite3` **before** dispatch. Input reservation uses UTF-8 bytes plus overhead, rather than a model tokenizer; it is not a provider-enforced dollar cap. Successful responses replace that reservation with OpenRouter's reported `usage.cost`, including reasoning. Price ceilings and output token limits are sent to OpenRouter. The cap excludes credit-purchase fees and unrelated account usage; each different output directory has a separate budget. Uncertain requests keep their reservation and are never automatically resent. Errors or charges above a reservation stop new dispatch; inspect the report before proceeding. Existing successful judgments are reused when rerunning the same input, configuration, references and implementation. Changed inputs, models, rubrics or structural checks require a new output directory and a newly budgeted run. Keep previous pilot folders for comparison.
 
 Outputs under the chosen directory:
 
 - `sample.jsonl`: selected original examples and provenance.
-- `judgments.jsonl`: structured decisions, short findings, dimension ratings, provider/generation IDs, token usage and cost.
+- `judgments.jsonl`: structured decisions, short English findings, dimension ratings, provider/generation IDs, token usage and cost. Malformed responses, including control characters in findings, remain unjudged.
 - `state.sqlite3`: durable request reservations and results for resumption; keep this with the reports.
 - `manifest.json` and `report.md`: progress, counts, costs and provisional-reference comparisons.
 
-The pilot assesses visible answers and tool calls. Stored assistant reasoning and previous quality labels are excluded from judge requests; originals remain in the sample. Repairs are only recommendations. AISA call comparisons use the historical `call_target_verdict` where available, because older whole-row assessments also examined stored reasoning.
+The pilot assesses visible answers and tool calls. Stored assistant reasoning, task/dialect metadata and previous quality labels are excluded from judge inputs; originals remain in the sample. Metadata selects an advisory rubric, but the actual conversation determines requirements. Python supplies limited structural checks for tool examples (names, JSON types, required fields, enums and additional properties); a pass does not verify argument grounding, execution or every JSON Schema constraint. Integer-valued numbers such as `3.0` are valid integers. The rubric avoids invented date-format requirements, literal treatment of fictional placeholders and rejection of valid dialect for differing from MSA. Repairs are only recommendations. AISA call comparisons use the historical `call_target_verdict` where available, because older whole-row assessments also examined stored reasoning.
 
 **Reference agreement is not validated accuracy.** The existing 433 assessments are provisional AI reviews and informed the rubrics. Inspect disagreements and independent samples of keeps, then adjudicate task/family-disjoint examples before claiming judge reliability. Factual/religious verification, benchmark contamination checks, source balancing and an SFT export remain separate work. Input text is never silently truncated; oversized examples stay unjudged.
 
@@ -196,7 +198,7 @@ Use the exact intended benchmark version and record its provenance with the refe
 ```text
 configs/data.yaml                    # Pinned inputs and processing settings
 configs/curation.yaml                # Offline curation routing and sample settings
-configs/quality.yaml                 # Luna judge rubrics and pilot spending limit
+configs/quality.yaml                 # Muse judge rubrics and pilot spending limit
 src/barq/data.py                     # Loading, CLI, processing and reports
 src/barq/rules.py                    # Validation, cleaning and fingerprints
 src/barq/review.py                   # Offline review sampling and reports

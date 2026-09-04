@@ -47,7 +47,7 @@ def verdict(decision="keep", **dimensions):
 
 def response(result=None, *, cost=0.0001):
     return {
-        "id": "gen-fake", "model": "openai/gpt-5.6-luna", "provider": "OpenAI",
+        "id": "gen-fake", "model": "meta/muse-spark-1.3-contributor", "provider": "Meta",
         "choices": [{"finish_reason": "stop", "message": {
             "content": json.dumps(result if result is not None else verdict()),
         }}],
@@ -186,6 +186,85 @@ class JudgeIntegrationTests(unittest.TestCase):
             self.assertNotIn(sentinel, serialized)
         self.assertNotIn("tools", payload)
 
+    def test_routing_metadata_is_not_presented_as_the_user_request(self):
+        row = example(0, task="TASK_SENTINEL", task_hint="HINT_SENTINEL",
+                      dialect="DIALECT_SENTINEL")
+        payload, _, _ = self.quality.make_payload(row, self.config)
+        sample = json.loads(payload["messages"][1]["content"].split("\n", 1)[1])
+        for key in ("task", "task_hint", "dialect", "dialect_hint"):
+            self.assertNotIn(key, sample)
+        self.assertEqual(sample["messages"], row["messages"])
+        for sentinel in ("TASK_SENTINEL", "HINT_SENTINEL", "DIALECT_SENTINEL"):
+            self.assertNotIn(sentinel, json.dumps(payload))
+
+    def test_tool_structural_evidence_handles_json_types_without_invented_dates(self):
+        row = example(0, task="tool_use", tool_behavior="call")
+        row["tools"] = [{"type": "function", "function": {
+            "name": "book_hotel", "parameters": {
+                "type": "object", "properties": {
+                    "guests": {"type": "integer"}, "arrival": {"type": "string"},
+                }, "required": ["guests", "arrival"], "additionalProperties": False,
+            },
+        }}]
+        # A string date has no implicit ISO format or year requirement. JSON Schema
+        # integers include integral floats but never Python's bool-as-int shortcut.
+        cases = [
+            ({"guests": 3.0, "arrival": "5 نوفمبر"}, None),
+            ({"guests": 3.5, "arrival": "5 نوفمبر"}, "tool_argument_type"),
+            ({"guests": True, "arrival": "5 نوفمبر"}, "tool_argument_type"),
+            ({"arrival": "5 نوفمبر"}, "missing_required_tool_argument"),
+        ]
+        for arguments, expected_reason in cases:
+            with self.subTest(arguments=arguments):
+                row["messages"][-1] = {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"type": "function", "function": {
+                        "name": "book_hotel", "arguments": json.dumps(arguments),
+                    }}],
+                }
+                payload, _, _ = self.quality.make_payload(row, self.config)
+                sample = json.loads(payload["messages"][1]["content"].split("\n", 1)[1])
+                checks = sample["structural_checks"]
+                self.assertEqual(checks["status"], "fail" if expected_reason else "pass")
+                if expected_reason:
+                    self.assertIn(expected_reason, checks["reasons"])
+                else:
+                    self.assertEqual(checks["reasons"], [])
+                self.assertIn("structure", checks["scope"].lower())
+                self.assertIn("semantics", checks["scope"].lower())
+                self.assertIn("not checked", checks["scope"].lower())
+                self.assertEqual(sample["messages"], row["messages"])
+
+    def test_provider_reasoning_effort_is_checked_against_the_live_catalogue(self):
+        model = {
+            "id": self.config["model"],
+            "supported_parameters": ["structured_outputs", "reasoning", "max_tokens"],
+            "pricing": {"prompt": "0.0000001", "completion": "0.0000002"},
+            "reasoning": {"mandatory": True, "supported_efforts": ["minimal", "medium"]},
+        }
+        for effort, accepted in [("minimal", True), ("medium", True), ("high", False), ("none", False)]:
+            with self.subTest(effort=effort):
+                config = {**self.config, "reasoning_effort": effort}
+                with patch.object(self.quality, "request_json", side_effect=[{}, {"data": [model]}]):
+                    if accepted:
+                        result = self.quality.check_provider(config, "test-key-never-sent")
+                        self.assertEqual(result["model"], model["id"])
+                    else:
+                        with self.assertRaises(ValueError):
+                            self.quality.check_provider(config, "test-key-never-sent")
+
+    def test_provider_mandatory_reasoning_cannot_be_disabled_without_effort_list(self):
+        model = {
+            "id": self.config["model"],
+            "supported_parameters": ["structured_outputs", "reasoning", "max_tokens"],
+            "pricing": {"prompt": "0.0000001", "completion": "0.0000002"},
+            "reasoning": {"mandatory": True},
+        }
+        config = {**self.config, "reasoning_effort": "none"}
+        with patch.object(self.quality, "request_json", side_effect=[{}, {"data": [model]}]):
+            with self.assertRaises(ValueError):
+                self.quality.check_provider(config, "test-key-never-sent")
+
     def test_transport_error_is_not_automatically_retried(self):
         self.write_rows([example(0)])
         attempts = []
@@ -260,6 +339,24 @@ class JudgeIntegrationTests(unittest.TestCase):
             self.run_pilot(execute=True, budget_usd=6)
         self.assertEqual(self.calls, [])
 
+    def test_charge_above_reservation_stops_dispatch_and_is_not_counted_as_keep(self):
+        self.config["concurrency"] = 1
+        self.write_config()
+        self.write_rows([example(0), example(1)])
+        reservation = self.quality.make_payload(example(0), self.config)[1]
+        cost = reservation * 2
+
+        def unexpected_cost(payload, api_key):
+            self.calls.append(payload)
+            return response(cost=str(cost))
+
+        result = self.run_pilot(execute=True, transport=unexpected_cost)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(result["status"], "stopped_on_error")
+        self.assertEqual(result["counts"], {"unjudged": 1})
+        self.assertEqual(Decimal(result["accounted_cost_usd"]), cost)
+        self.assertEqual(records(self.output / "judgments.jsonl")[0]["status"], "error")
+
     def test_provider_rate_error_retains_reservation_without_resending(self):
         self.write_rows([example(0)])
         def throttled(payload, api_key):
@@ -300,6 +397,37 @@ class JudgeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertFalse(any(row.get("judgment", {}).get("decision") == "keep"
                              for row in records(self.output / "judgments.jsonl")))
+
+    def test_reason_control_characters_are_rejected_without_rejecting_arabic_or_layout(self):
+        for character in ("\u0000", "\u0006", "\r", "\u001f", "\u007f"):
+            with self.subTest(character=repr(character)):
+                result = verdict()
+                result["reasons"] = [f"Corrupted quoted fragment: {character}39"]
+                with self.assertRaises(ValueError):
+                    self.quality.validate_judgment(result)
+        valid = verdict()
+        valid["reasons"] = ["الإجابة تتبع الطلب.\nEvidence:\tcomplete response."]
+        self.assertEqual(self.quality.validate_judgment(valid), valid)
+
+    def test_parsed_control_character_response_is_unjudged_but_retains_billed_cost(self):
+        self.write_rows([example(0)])
+
+        def corrupted(payload, api_key):
+            self.calls.append(payload)
+            result = verdict()
+            result["reasons"] = ["The answer includes '\u000639'."]
+            return response(result, cost="0.00021")
+
+        result = self.run_pilot(execute=True, transport=corrupted)
+        self.assertEqual(result["status"], "stopped_on_error")
+        self.assertEqual(result["counts"], {"unjudged": 1})
+        self.assertEqual(Decimal(result["actual_cost_usd"]), Decimal("0.00021"))
+        self.assertEqual(Decimal(result["accounted_cost_usd"]), Decimal("0.00021"))
+        saved = records(self.output / "judgments.jsonl")[0]
+        self.assertEqual(saved["status"], "error")
+        self.assertNotIn("judgment", saved)
+        self.run_pilot(execute=True, transport=corrupted)
+        self.assertEqual(len(self.calls), 1)
 
     def test_matching_provisional_labels_are_selected_without_leaking_to_judge(self):
         rows = [example(index) for index in range(20)]

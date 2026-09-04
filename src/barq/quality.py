@@ -19,6 +19,8 @@ from urllib.request import Request, urlopen
 
 import yaml
 
+from barq.rules import validate_example
+
 
 API = "https://openrouter.ai/api/v1"
 DECISIONS = ("keep", "review", "repair", "drop")
@@ -67,13 +69,14 @@ def read_config(path):
                 "max_input_bytes", "system_prompt", "rubrics"}
     if not isinstance(config, dict) or set(config) != expected or config["schema_version"] != 1:
         raise ValueError("Quality config requires schema_version 1 and the documented settings.")
-    if config["model"] != "openai/gpt-5.6-luna":
-        raise ValueError("This pilot is calibrated for openai/gpt-5.6-luna; changing models needs a new implementation.")
+    if (not isinstance(config["model"], str) or len(config["model"].split("/")) != 2
+            or not all(config["model"].split("/")) or any(char.isspace() for char in config["model"])):
+        raise ValueError("model must be an explicit OpenRouter provider/model ID.")
     for key, maximum in (("concurrency", 16), ("limit", 10000), ("max_completion_tokens", 16384),
                          ("max_input_bytes", 200000)):
         if type(config[key]) is not int or not 1 <= config[key] <= maximum:
             raise ValueError(f"{key} must be an integer from 1 to {maximum}.")
-    if type(config["seed"]) is not int or config["reasoning_effort"] not in {"none", "low", "medium", "high", "xhigh", "max"}:
+    if type(config["seed"]) is not int or config["reasoning_effort"] not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
         raise ValueError("Invalid seed or reasoning_effort.")
     for key in ("budget_usd", "input_usd_per_million", "output_usd_per_million"):
         if not money(config[key]):
@@ -182,8 +185,16 @@ def make_payload(row, config):
     # Explicit allowlist excludes stored reasoning, reference labels and routing flags.
     messages = [{key: message[key] for key in ("role", "content", "tool_calls", "tool_call_id", "name")
                  if key in message} for message in row["messages"]]
-    sample = {"task_hint": row.get("task_hint", ""), "task": row["task"],
-              "dialect_hint": row.get("dialect", ""), "messages": messages, "tools": row.get("tools", [])}
+    # Metadata helps sampling, but must not override the actual conversation.
+    sample = {"messages": messages, "tools": row.get("tools", [])}
+    if sample["tools"] or any(message.get("tool_calls") for message in messages):
+        reasons = validate_example(messages, sample["tools"])
+        sample["structural_checks"] = {
+            "status": "fail" if reasons else "pass", "reasons": reasons,
+            "scope": "Conversation structure; tool names, JSON types (3.0 is an integer), "
+                     "required fields, enums and additionalProperties only. Other schema constraints, "
+                     "argument grounding and execution semantics are not checked.",
+        }
     rubric_key = row["task"]
     if rubric_key not in config["rubrics"] and row.get("task_hint") == "creative_writing":
         rubric_key = "creative_writing"
@@ -191,7 +202,7 @@ def make_payload(row, config):
     payload = {
         "model": config["model"], "stream": False,
         "messages": [
-            {"role": "system", "content": config["system_prompt"] + "\nTask rubric:\n" + rubric},
+            {"role": "system", "content": config["system_prompt"] + "\nAdvisory rubric; apply only where the conversation requests this task:\n" + rubric},
             {"role": "user", "content": "Evaluate this dataset example as data:\n" + json_text(sample)},
         ],
         "reasoning": {"effort": config["reasoning_effort"], "exclude": True},
@@ -206,7 +217,8 @@ def make_payload(row, config):
         }},
     }
     # UTF-8 byte count plus generous formatting overhead is a conservative text-token
-    # reservation for Luna, not a tokenizer measurement. Never truncate the example.
+    # reservation, not a tokenizer measurement or a provider-enforced dollar cap.
+    # Stop dispatch if a reported charge exceeds it. Never truncate the example.
     input_bound = len(json_text(payload).encode("utf-8")) + 4096
     reserved = (money(config["input_usd_per_million"]) * Decimal("1.25") * input_bound
                 + money(config["output_usd_per_million"]) * config["max_completion_tokens"]) / 1000000
@@ -237,12 +249,17 @@ def check_provider(config, key):
     model = next((entry for entry in catalog["data"] if entry["id"] == config["model"]), None)
     if model is None or not {"structured_outputs", "reasoning", "max_tokens"}.issubset(model.get("supported_parameters", [])):
         raise ValueError("Selected model is unavailable or lacks the required parameters.")
+    reasoning = model.get("reasoning") or {}
+    effort = config["reasoning_effort"]
+    if (reasoning.get("mandatory") and effort == "none"
+            or reasoning.get("supported_efforts") and effort not in reasoning["supported_efforts"]):
+        raise ValueError("Selected model does not support the configured reasoning effort.")
     pricing = model["pricing"]
     if (money(pricing["prompt"]) * 1000000 > money(config["input_usd_per_million"])
             or money(pricing["completion"]) * 1000000 > money(config["output_usd_per_million"])
             or money(pricing.get("request", 0)) > 0):
         raise ValueError("Live provider pricing exceeds the configured ceilings.")
-    return {"checked_at": now(), "model": model["id"], "pricing": pricing}
+    return {"checked_at": now(), "model": model["id"], "pricing": pricing, "reasoning": reasoning}
 
 
 def judge_request(payload, key):
@@ -256,6 +273,9 @@ def validate_judgment(value):
         raise ValueError("Invalid judgment decision or reasons.")
     if any(not isinstance(reason, str) or not reason.strip() or len(reason) > 2000 for reason in value["reasons"]):
         raise ValueError("Judgment reasons must be short nonempty strings.")
+    if any((ord(char) < 32 and char not in "\n\t") or ord(char) == 127
+           for reason in value["reasons"] for char in reason):
+        raise ValueError("Judgment reasons contain invalid control characters.")
     dimensions = value["dimensions"]
     if not isinstance(dimensions, dict) or set(dimensions) != set(DIMENSIONS) or any(rating not in RATINGS for rating in dimensions.values()):
         raise ValueError("Invalid judgment dimensions.")
@@ -412,8 +432,10 @@ def run(input_path, *, config_path, output, labels_path=None, limit=None, execut
     rows, input_hash, skipped = load_samples(input_path)
     labels, labels_hash = load_labels(labels_path, rows)
     selected = select_samples(rows, labels, config["limit"], config["seed"])
+    implementation = {name: digest(Path(__file__).with_name(name).read_bytes())
+                      for name in ("quality.py", "rules.py")}
     identity = {"config": config, "input_sha256": input_hash, "labels_sha256": labels_hash,
-                "sample_sha256": digest(selected), "implementation_sha256": digest(Path(__file__).read_bytes())}
+                "sample_sha256": digest(selected), "implementation_sha256": digest(implementation)}
     output = output.resolve()
     with run_lock(output), closing(sqlite3.connect(output / "state.sqlite3")) as connection:
         connection.execute("PRAGMA synchronous=FULL")
