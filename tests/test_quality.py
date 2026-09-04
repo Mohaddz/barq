@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import unittest
+import warnings
 
 from barq.rules import review_checks
 
@@ -52,12 +53,53 @@ class QualityChecksTests(unittest.TestCase):
         good = review(prompt, "مثال:\n```python\ndef double(x):\n    return 2 * x\n```\nشرح المثال")
         self.assertEqual(good["flags"], [])
         self.assertEqual(good["checks"], ["python_syntax"])
-        self.assertEqual(review(prompt, "def double(:")["flags"], ["python_syntax_invalid"])
+        malformed = review(prompt, "```python\ndef double(:\n```")
+        self.assertEqual(malformed["flags"], ["python_syntax_invalid"])
+        self.assertEqual(malformed["checks"], ["python_syntax"])
+        bare = review(prompt, "def double(x):\n    return 2 * x")
+        self.assertEqual(bare["flags"], [])
+        self.assertEqual(bare["checks"], ["python_syntax"])
         self.assertEqual(review(prompt, "print(2)")["flags"], ["python_function_missing"])
         self.assertEqual(review(prompt, "# TODO")["flags"], ["python_code_empty"])
         program = review("اكتب برنامج بلغة بايثون", 'raise AssertionError("must not execute")')
         self.assertEqual(program["flags"], [])
         self.assertEqual(program["checks"], ["python_syntax"])
+
+    def test_python_uses_requested_construct_and_accepts_explicit_lambda(self):
+        # Mentioning functions in a prohibition does not request a function definition.
+        code = review("اكتب كود بايثون لعكس التسلسل دون استخدام أي دالة مدمجة.",
+                      "sequence = (1, 2, 3)\nreverse = sequence[::-1]")
+        self.assertEqual(code["flags"], [])
+        for prompt in ("اكتب دالة لامدا في بايثون لحساب المتوسط",
+                       "Write a Python lambda function that doubles a number."):
+            with self.subTest(prompt=prompt):
+                result = review(prompt, "double = lambda x: 2 * x")
+                self.assertEqual(result["flags"], [])
+                self.assertEqual(result["checks"], ["python_syntax"])
+        named = review("Write a Python function named double.", "double = lambda x: 2 * x")
+        self.assertEqual(named["flags"], [])
+        self.assertEqual(named["checks"], ["python_syntax"])
+
+    def test_unfenced_prose_or_pseudocode_remains_reviewable_without_syntax_verdict(self):
+        examples = [
+            "قم بإدراج كل ما يلي إلى اللغة العربية:\n\ndef most_common(items):\n    return max(items)",
+            "احسب كمية الطين.\n\ndef clay(vases, bowls):\n    value = vases * 2\n    value = bowls\n    return value + value",
+            "def sum_even(:",
+            "إذا لم تكن هناك مسارات:\n    إرجاع 0.0",
+        ]
+        for answer in examples:
+            with self.subTest(answer=answer):
+                result = review("اكتب دالة بايثون", answer)
+                self.assertEqual(result["flags"], ["python_answer_unparsed"])
+                self.assertEqual(result["checks"], ["python_syntax_skipped_unparsed_answer"])
+
+    def test_python_syntax_warning_is_suppressed_only_inside_review(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = review("Write a Python program.", r"pattern = '\d+'")
+            warnings.warn("outside review", SyntaxWarning)
+        self.assertEqual(result["flags"], [])
+        self.assertEqual([str(item.message) for item in caught], ["outside review"])
 
     def test_python_does_not_grade_explanation_repair_or_oversized_code(self):
         for prompt in ("Explain how to write a Python function.", "Fix this Python program.",

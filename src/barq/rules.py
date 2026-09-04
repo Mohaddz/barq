@@ -11,6 +11,7 @@ import json
 import math
 import re
 import unicodedata
+import warnings
 
 
 _ROLES = {"system", "developer", "user", "assistant", "tool"}
@@ -289,9 +290,10 @@ _SENTIMENT_PREFIX = "ما هو شعور النص التالي؟\n\n"
 _REQUEST_START = r"(?:^|\n)\s*(?:(?:من فضلك|لو سمحت|please|can you|could you)\s*[,،]?\s*)?"
 _PYTHON_REQUEST = re.compile(
     _REQUEST_START + r"(?:[اأ]كتب|أنشئ|انشئ|برمج)\s+(?:لي\s+)?"
-    r"(?:دالة|وظيفة|برنامج|كود|شيفرة|شفرة)\b|"
+    r"(?P<arabic_construct>دالة|وظيفة|برنامج|كود|شيفرة|شفرة)\b|"
     + _REQUEST_START + r"(?:write|create|implement|build)\s+(?:(?:me|a|an|the)\s+){0,2}"
-    r"(?:python(?:\s*3)?\s+)?(?:function|program|script|code)\b", re.IGNORECASE,
+    r"(?:python(?:\s*3)?\s+)?(?:lambda\s+)?"
+    r"(?P<english_construct>function|program|script|code)\b", re.IGNORECASE,
 )
 _CREATIVE_REQUEST = re.compile(
     _REQUEST_START + r"[اأ]كتب\s+(?:لي\s+)?(?:قصة|قصّة|قصيدة|رواية|حكاية|مشهد)\b|"
@@ -351,7 +353,8 @@ def review_checks(messages: list[dict], tools: list[dict], source: str, task: st
         if "مواضيع قد تهمك نهاية" in prompt:
             flags.append("source_boilerplate")
 
-    if (task != "tool_use" and _PYTHON_REQUEST.search(prompt)
+    request = _PYTHON_REQUEST.search(prompt)
+    if (task != "tool_use" and request
             and re.search(r"\bpython(?:3)?\b|بايثون|بيثون", prompt, re.I)
             and not final.get("tool_calls")):
         blocks = re.findall(r"```[ \t]*(?:python3?|py)[ \t]*\r?\n(.*?)```", answer, re.I | re.S)
@@ -361,21 +364,24 @@ def review_checks(messages: list[dict], tools: list[dict], source: str, task: st
             checks.append("python_syntax_skipped_too_long")
         else:
             try:
-                tree = ast.parse(code)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    tree = ast.parse(code)
             except (MemoryError, RecursionError):
                 flags.append("python_check_skipped_parser_limit")
                 checks.append("python_syntax_skipped_parser_limit")
             except (SyntaxError, ValueError):
-                checks.append("python_syntax")
-                flags.append("python_syntax_invalid")
+                checks.append("python_syntax" if blocks else "python_syntax_skipped_unparsed_answer")
+                flags.append("python_syntax_invalid" if blocks else "python_answer_unparsed")
             else:
                 checks.append("python_syntax")
+                construct = (request.group("arabic_construct") or request.group("english_construct")).lower()
                 meaningful = [node for node in tree.body if not isinstance(node, ast.Pass)
                               and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
                 if not meaningful:
                     flags.append("python_code_empty")
-                elif re.search(r"\bfunction\b|دالة|وظيفة", prompt, re.I) and not any(
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(tree)
+                elif construct in {"function", "دالة", "وظيفة"} and not any(
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) for node in ast.walk(tree)
                 ):
                     flags.append("python_function_missing")
     return {"flags": flags, "checks": checks, "task_hint": hint}

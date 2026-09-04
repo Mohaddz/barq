@@ -156,7 +156,9 @@ def write_report(path, manifest):
     lines += ["", "### Check coverage", ""]
     lines += [f"- `{name}` applied: {count:,}" for name, count in sorted(manifest["check_counts"].items())]
     lines += [f"- `{name}`: {count:,}" for name, count in sorted(manifest["skipped_check_counts"].items())]
-    lines += ["", "Python is parsed, never executed: syntax does not prove correct behavior. Sentiment "
+    lines += ["", "Python is parsed, never executed: syntax does not prove correct behavior. A failed parse "
+              "of an unfenced answer is flagged as `python_answer_unparsed` and excluded from applied syntax "
+              "counts, because prose and code may be mixed. Sentiment "
               "checks validate label vocabulary only. Diacritization checks preserve underlying text and "
               "detect outputs without vowel marks; they do not verify every vowel. Creative-writing hints "
               "are simple routing heuristics, not authoritative task labels.", "",

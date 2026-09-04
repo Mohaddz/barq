@@ -75,6 +75,8 @@ Review scans the existing data without downloading datasets or calling models. I
 
 Checks look for changed underlying letters or absent added diacritics in diacritization tasks, unexpected sentiment labels, Python syntax/function issues when applicable, and visible web boilerplate. Python snippets are parsed, never executed. Flags are review hints: valid syntax does not establish correct code, preserved letters do not establish correct diacritics, and unflagged answers may still be wrong. The report includes check coverage and carries forward the preparation run's benchmark status; review does not add new benchmark checks.
 
+Python checks distinguish a requested function from a program that merely mentions functions, and recognize lambda expressions as functions. A parse failure in an unfenced answer receives `python_answer_unparsed`, with a skipped-check count: prose may surround valid code. `python_syntax_invalid` is reserved for failed parsing of explicitly Python-fenced code. Reports created before these corrections retain their original flags; inspect those cases before deciding what to exclude.
+
 Read `reports/review/<run-id>/review.md`, then inspect `review_samples.jsonl` and `flagged_samples.jsonl`. The report also summarizes source/task coverage and preparation decisions. Share those small files and `manifest.json` for review; the large dataset can stay on the VM. Keep the prepared outputs on retained storage before deleting a VM.
 
 This stage does not judge factual correctness with an LLM, rewrite or delete answers, assign an automatic quality score, choose source weights, or produce a final SFT dataset.
