@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-barq = "barq.data:main"
+barq = "barq.quality:cli"
 
 [dependency-groups]
 # The optional launcher and older Modal builders need the SDK in the environment.

@@ -2,7 +2,7 @@
 
 Phase 0 prepares and audits Arabic chat and tool-use data before training. It uses pinned copies of [arabic-sft-mix-2](https://huggingface.co/datasets/Mohaddz/arabic-sft-mix-2) and [AISA-ArabicFC](https://huggingface.co/datasets/TuwaiqAcademy/AISA-ArabicFC).
 
-No training, RL, model judging, paid API calls or credentials are required. Audit and preparation need internet access to fetch public data. Review and curation use only prepared files already on disk.
+Audit and preparation fetch public data. Review and curation use prepared files already on disk. The optional quality pilot calls a model only with `--execute` and an OpenRouter API key; other stages require no paid API or credentials. Training and RL are later phases.
 
 ## Run
 
@@ -128,6 +128,55 @@ modal volume get barq-data latest.json -
 
 After completion, `latest.json` identifies the saved stage runs and report paths. Download individual reports with `modal volume get barq-data reports/curate/RUN_ID/curation.md ./curation.md`. The Volume survives the compute job, but deleting the Volume deletes that retained copy. Commit behavior and detached jobs are described in [Modal Volumes](https://modal.com/docs/guide/volumes) and [invocation durability](https://modal.com/docs/guide/function-invocation-methods).
 
+## Quality judge pilot
+
+`barq quality` uses a small existing review or curation `review_samples.jsonl` file. It does not download datasets or scan the full prepared corpus. `configs/quality.yaml` contains the OpenRouter model (`openai/gpt-5.6-luna`), task rubrics, four concurrent requests, a 1,000-row default, and a **$5 inference budget per output directory**. It adds no Python dependencies.
+
+Start with an offline preview, using the paths to your existing sample and optional reference assessments:
+
+```sh
+uv run --locked barq quality \
+  --input reports/review/RUN_ID/review_samples.jsonl \
+  --labels reports/assessment/RUN_ID/calibration.jsonl \
+  --output reports/quality/luna-pilot
+```
+
+Omit `--labels` when you have no reference file. Sample files and assessments are ignored by Git, so a clone needs its own copy; transfer only these small files or generate a review sample on the machine holding the prepared data. Reference examples are selected first, then remaining slots are filled across source/task/hint/dialect/tool-call and flagged/unflagged groups. Only labeled training rows are eligible. Selection quotas do not estimate corpus quality or final training weights.
+
+The September 5 pilot inputs are retained on `barq-data`. From a clone authenticated to that Modal workspace, retrieve just these small files:
+
+```sh
+mkdir -p reports/quality-inputs/20260905
+uv run --locked --group modal modal volume get barq-data reports/quality-inputs/20260905/review_samples.jsonl reports/quality-inputs/20260905/review_samples.jsonl
+uv run --locked --group modal modal volume get barq-data reports/quality-inputs/20260905/calibration.jsonl reports/quality-inputs/20260905/calibration.jsonl
+```
+
+Use those two local paths for `--input` and `--labels`. The full dataset stays on Modal.
+
+Set `OPENROUTER_API_KEY` through your environment. In Bash, `read -rsp 'OpenRouter key: ' OPENROUTER_API_KEY` followed by `export OPENROUTER_API_KEY` avoids putting the key in shell history. Do not put it in YAML or commit it. Preview the report, then add `--execute`. A useful first run adds `--max-new-requests 3`; afterward repeat the same command without that option to continue the same pilot. `--budget-usd` can lower the configured cap.
+
+```sh
+uv run --locked barq quality \
+  --input reports/review/RUN_ID/review_samples.jsonl \
+  --labels reports/assessment/RUN_ID/calibration.jsonl \
+  --output reports/quality/luna-pilot --execute --max-new-requests 3
+```
+
+Every billable request reserves a conservative maximum cost in `state.sqlite3` **before** dispatch. Successful responses replace that reservation with OpenRouter's reported `usage.cost`, including reasoning. Price ceilings and output token limits are sent to OpenRouter. The cap excludes credit-purchase fees and unrelated account usage; each different output directory has a separate budget. Uncertain requests keep their reservation and are never automatically resent. Errors stop new dispatch; inspect the report before proceeding. Existing successful judgments are reused when rerunning the same input, configuration, references and implementation. Changed inputs or rubrics require a new output directory and a newly budgeted run.
+
+Outputs under the chosen directory:
+
+- `sample.jsonl`: selected original examples and provenance.
+- `judgments.jsonl`: structured decisions, short findings, dimension ratings, provider/generation IDs, token usage and cost.
+- `state.sqlite3`: durable request reservations and results for resumption; keep this with the reports.
+- `manifest.json` and `report.md`: progress, counts, costs and provisional-reference comparisons.
+
+The pilot assesses visible answers and tool calls. Stored assistant reasoning and previous quality labels are excluded from judge requests; originals remain in the sample. Repairs are only recommendations. AISA call comparisons use the historical `call_target_verdict` where available, because older whole-row assessments also examined stored reasoning.
+
+**Reference agreement is not validated accuracy.** The existing 433 assessments are provisional AI reviews and informed the rubrics. Inspect disagreements and independent samples of keeps, then adjudicate task/family-disjoint examples before claiming judge reliability. Factual/religious verification, benchmark contamination checks, source balancing and an SFT export remain separate work. Input text is never silently truncated; oversized examples stay unjudged.
+
+OpenRouter documents [structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs), [usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting), and [provider price ceilings](https://openrouter.ai/docs/guides/routing/provider-selection#max-price).
+
 ## Benchmark references
 
 Every requested benchmark appears in `configs/data.yaml`. A `path: null` means **not checked**. No benchmark is silently downloaded or assumed clean.
@@ -147,16 +196,19 @@ Use the exact intended benchmark version and record its provenance with the refe
 ```text
 configs/data.yaml                    # Pinned inputs and processing settings
 configs/curation.yaml                # Offline curation routing and sample settings
+configs/quality.yaml                 # Luna judge rubrics and pilot spending limit
 src/barq/data.py                     # Loading, CLI, processing and reports
 src/barq/rules.py                    # Validation, cleaning and fingerprints
 src/barq/review.py                   # Offline review sampling and reports
 src/barq/curate.py                   # Offline training-candidate decisions and exports
+src/barq/quality.py                  # Bounded OpenRouter pilot and CLI dispatch
 src/barq/persistent.py               # Completed-stage reuse and persistence callbacks
 scripts/modal_pipeline.py            # Optional detached Modal job and named Volume
 tests/test_rules.py                  # Arabic and tool-preservation checks
 tests/test_data.py                   # Split, benchmark and export integration checks
 tests/test_review.py                # Review sampling and input integrity checks
 tests/test_quality.py               # Task-specific review hints
+tests/test_judge.py                 # Judge budget, resume and payload isolation
 tests/test_curate.py                # Offline routing, evaluation isolation and safe failure
 tests/test_curation_rules.py        # Grounding signals and conservative constraint checks
 data/raw/<dataset>/<revision>/       # Cached pinned source files
@@ -196,4 +248,4 @@ uv run --locked python -m unittest discover -s tests -v
 
 ## Later phases
 
-Keep Phase 0 outputs as the input contract. Use review samples and Phase 1 curation decisions to calibrate a teacher judge against manual reviews, configure benchmark references, and decide source weights and targeted repairs. Offline acceptance alone is insufficient for training. Teacher review and generation are future work; DataTrove can be added if near-duplicate detection warrants it. Then add `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons, and `rl.py` and `rewards.py` when the environments and reward checks are ready. No training renderer or RL prompts are generated yet.
+Keep Phase 0 outputs as the input contract. Use the quality pilot to inspect a judge against reviewed examples, then establish independent reference labels before scaling semantic review. Configure benchmark references and decide source weights and targeted repairs. Offline acceptance and provisional judge agreement are insufficient for training. Then add `sft.py` and `evaluate.py` for Tinker SFT and baseline comparisons, and `rl.py` and `rewards.py` when the environments and reward checks are ready. No training renderer or RL prompts are generated yet.
