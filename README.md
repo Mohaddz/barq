@@ -19,6 +19,7 @@ The default command runs a small audit. Useful explicit commands:
 uv run --locked barq audit --limit 100
 uv run --locked barq audit --limit 100 --dataset mix
 uv run --locked barq prepare
+uv run --locked barq prepare --workers 4
 ```
 
 `--dataset mix` or `--dataset aisa` selects one dataset. Both commands accept `--config configs/data.yaml` and an optional `--output PATH` for the workspace root; the default is the current working directory. This root contains the raw cache, processed data and reports. Benchmark paths still resolve relative to the config file.
@@ -30,6 +31,12 @@ uv run --locked barq prepare
 Audit samples are not representative source-level measurements. Rare sources can be missing, and duplicate/conflict checks cover only the rows inspected. The report shows observed coverage; it does not estimate full-dataset defect rates.
 
 **Prepare** downloads the pinned Parquet files into the local raw cache, then processes them in batches. It uses SQLite for duplicate/group tracking and writes Parquet batches rather than keeping the dataset in memory. Allow more than 2 GB of disk space for raw data, plus space for indexes and derived outputs.
+
+Local Parquet files are read directly through PyArrow. AISA's unused preformatted `text` and full `tools` registry are skipped during reading; the original files still contain them. Downloads already run concurrently across files.
+
+`prepare --workers 4` uses four processes for adaptation, validation, hashing and JSON encoding. The default is one process, which avoids startup and communication costs on small inputs. Work is queued in bounded batches; more workers use more memory. Duplicate decisions, split assignments, sampling and output writing remain ordered in the parent process, so worker count does not change the resulting rows. No GPU or distributed framework is needed.
+
+The terminal prints rows/second, and `audit.md` includes per-split processing timings. `manifest.json` also records worker count, download timings and total elapsed time. Compare these on your VM: extra workers cannot speed up network or disk bottlenecks, and may slow small runs.
 
 Each command creates a new run directory and processes its inputs afresh. Cached raw downloads are reused; processing does not resume from earlier runs. Existing outputs are not overwritten or automatically deleted.
 

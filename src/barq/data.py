@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
-from contextlib import closing
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing, ExitStack
 from copy import deepcopy
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
 from importlib.metadata import version
 import json
+from itertools import batched
+from multiprocessing import get_context
 from pathlib import Path
 import random
 import re
@@ -151,11 +154,18 @@ def download_source(source, raw_root):
 
 
 def prepare_rows(files, split, raw_root):
-    from datasets import load_dataset
-
-    rows = load_dataset("parquet", data_files={split: files[split]}, split=split,
-                        streaming=True, cache_dir=str(raw_root / ".metadata"))
-    yield from enumerate(rows)
+    """Read bounded Arrow batches in file order, preserving original row indices."""
+    row_index = 0
+    for path in files[split]:
+        with pq.ParquetFile(path) as parquet:
+            columns = parquet.schema_arrow.names
+            if "tools_sampled" in columns:
+                # These two large AISA fields remain in raw files but are never adapted.
+                columns = [name for name in columns if name not in {"text", "tools"}]
+            for batch in parquet.iter_batches(batch_size=512, columns=columns):
+                for row in batch.to_pylist():
+                    yield row_index, row
+                    row_index += 1
 
 
 def clean_schema(schema):
@@ -255,6 +265,70 @@ def adapt_row(raw, source):
                 ("dialect", "requires_function", "tool_called", "negative_category")}
     return {"messages": messages, "tools": tools, "source": source["repo_id"],
             "task": "tool_use", "metadata": metadata, "adapter_notes": sorted(set(notes))}
+
+
+def process_batch(batch, source, original_split):
+    """Pure row work; workers never access SQLite, sinks, or sampling state."""
+    labeled = original_split not in source.get("unlabeled_splits", [])
+    official_eval = source["preserve_splits"] and original_split != "train"
+    prepared = []
+    for row_index, raw in batch:
+        item = adapt_row(raw, source)
+        source_name = item["source"] if isinstance(item["source"], str) else "unknown"
+        task = item["task"] if isinstance(item["task"], str) else "unknown"
+        common = {
+            "id": digest(f"{source['repo_id']}@{source['revision']}:{source['config']}:{original_split}:{row_index}"),
+            "dataset": source["name"], "revision": source["revision"],
+            "source": source_name, "task": task, "original_split": original_split,
+            "split": "validation" if original_split == "dev" else original_split,
+            "row_index": row_index, "is_labeled": labeled,
+        }
+        problems = validate_example(item["messages"], item["tools"], allow_missing_target=not labeled)
+        if source_name == "unknown" or task == "unknown":
+            problems.append("missing_source_or_task")
+        if "missing_candidate_tools" in item["adapter_notes"]:
+            problems.append("missing_candidate_tools")
+        full_hash = input_hash = protected_group = None
+        encoded = {}
+        keys = []
+        if not problems:
+            full_hash, input_hash = fingerprints(item["messages"], item["tools"])
+            keys = [benchmark_key(text) for text in benchmark_texts(item["messages"])]
+            encoded = {"messages_json": json_text(item["messages"]),
+                       "tools_json": json_text(item["tools"]), "metadata_json": json_text(item["metadata"])}
+        elif official_eval and isinstance(item["messages"], list) and isinstance(item["tools"], list):
+            # A malformed gold target must still reserve its evaluation input.
+            try:
+                _, protected_group = fingerprints(item["messages"], item["tools"])
+            except (ValueError, TypeError):
+                pass
+        prepared.append((common, item, problems, full_hash, input_hash, protected_group, keys, encoded))
+    return prepared
+
+
+def checked_rows(rows, source, split, batch_size, executor=None, workers=1):
+    """Keep at most two batches per worker queued and consume them in source order."""
+    batches = iter(batched(rows, min(batch_size, 256)))
+    if executor is None:
+        for batch in batches:
+            yield from process_batch(batch, source, split)
+        return
+    pending = deque()
+    try:
+        for _ in range(2 * workers):
+            batch = next(batches, None)
+            if batch is None:
+                break
+            pending.append(executor.submit(process_batch, batch, source, split))
+        while pending:
+            result = pending.popleft().result()
+            batch = next(batches, None)
+            if batch is not None:
+                pending.append(executor.submit(process_batch, batch, source, split))
+            yield from result
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def load_benchmarks(config, config_dir, connection):
@@ -362,6 +436,13 @@ def write_report(path, manifest, counts, reasons, groups, dialects, observed, sa
         lines += ["This preview uses small, seeded pages spread across each selected split. It is not a",
                   "representative quality estimate. Counts and duplicate findings cover the sample only.",
                   "No full dataset files were downloaded. Sampling may miss rare sources/tasks.", ""]
+    else:
+        lines += [f"Worker processes: **{manifest['workers']}**", "",
+                  "## Processing speed", "", "| Split | Seconds | Rows/second |", "|---|---:|---:|"]
+        for split, timing in manifest["timings"]["processing"].items():
+            lines.append(f"| {split} | {timing['seconds']:.2f} | {timing['rows_per_second']:,.0f} |")
+        lines += ["", "Processing timings include local reads and batched checks/writes, excluding downloads",
+                  "and the final output flush. Download and total elapsed times are in manifest.json.", ""]
     lines += ["## Decisions", "", "| Decision | Rows |", "|---|---:|"]
     lines += [f"| {key} | {value:,} |" for key, value in sorted(counts.items())]
     lines += ["", "## Source/task coverage", "", "| Source | Task | Inspected | Kept |", "|---|---|---:|---:|"]
@@ -399,7 +480,8 @@ def write_report(path, manifest, counts, reasons, groups, dialects, observed, sa
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run(config, config_path, mode, root, limit=None, selected=None):
+def run(config, config_path, mode, root, limit=None, selected=None, *, workers=1):
+    started = time.perf_counter()
     sources = [source for source in config["datasets"] if selected is None or source["name"] == selected]
     if not sources:
         raise ValueError(f"Unknown dataset {selected!r}.")
@@ -407,6 +489,12 @@ def run(config, config_path, mode, root, limit=None, selected=None):
         raise ValueError("--limit is only for audit; prepare always processes all selected rows.")
     if limit is not None and limit < 1:
         raise ValueError("--limit must be positive.")
+    if type(workers) is not int or workers < 1:
+        raise ValueError("--workers must be a positive integer.")
+    if sys.platform == "win32" and workers > 61:
+        raise ValueError("Windows supports at most 61 worker processes.")
+    if mode == "audit" and workers != 1:
+        raise ValueError("--workers is only for prepare; audit uses small network previews.")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
     output = root / "data" / "processed" / mode / run_id
     report_dir = root / "reports" / mode / run_id
@@ -422,6 +510,8 @@ def run(config, config_path, mode, root, limit=None, selected=None):
                     Path(__file__).read_bytes() + Path(__file__).with_name("rules.py").read_bytes()
                 ).hexdigest(),
                 "packages": {name: version(name) for name in ("barq", "datasets", "huggingface-hub", "pyarrow", "pyyaml")},
+                "workers": workers, "worker_batch_size": min(config["batch_size"], 256),
+                "timings": {"downloads": {}, "processing": {}},
                 "benchmarks": [], "source_files": {}, "output": str(output)}
     manifest_path = report_dir / "manifest.json"
     manifest_path.write_text(json_text(manifest) + "\n", encoding="utf-8")
@@ -433,7 +523,7 @@ def run(config, config_path, mode, root, limit=None, selected=None):
     sample_rng = random.Random(config["seed"])
     downloads, split_counts = {}, {}
     try:
-        with closing(sqlite3.connect(output / "index.sqlite3")) as connection:
+        with closing(sqlite3.connect(output / "index.sqlite3")) as connection, ExitStack() as stack:
             connection.executescript("""
                 PRAGMA journal_mode=WAL;
                 PRAGMA cache_size=-32768;
@@ -441,6 +531,10 @@ def run(config, config_path, mode, root, limit=None, selected=None):
                 CREATE TABLE groups (hash TEXT PRIMARY KEY, split TEXT NOT NULL, protected INTEGER NOT NULL);
             """)
             manifest["benchmarks"] = load_benchmarks(config, config_path.parent, connection)
+            has_benchmarks = any(item["status"] == "checked_exact" for item in manifest["benchmarks"])
+            executor = stack.enter_context(ProcessPoolExecutor(
+                max_workers=workers, mp_context=get_context("spawn")
+            )) if workers > 1 else None
             for name, schema in (("candidates", CANDIDATE_SCHEMA), ("holdout", CANDIDATE_SCHEMA), ("decisions", DECISION_SCHEMA)):
                 sinks.append(ParquetSink(output / f"{name}.parquet", schema, config["batch_size"]))
             candidate_sink, holdout_sink, decision_sink = sinks
@@ -450,42 +544,27 @@ def run(config, config_path, mode, root, limit=None, selected=None):
                     rows = audit_rows(source, original_split, limit or config["audit_rows"], config["seed"])
                 else:
                     if source["name"] not in downloads:
+                        download_started = time.perf_counter()
                         downloads[source["name"]] = download_source(source, root / "data" / "raw")
                         manifest["source_files"][source["name"]] = downloads[source["name"]]
+                        manifest["timings"]["downloads"][source["name"]] = round(time.perf_counter() - download_started, 3)
                     rows = prepare_rows(downloads[source["name"]], original_split, root / "data" / "raw")
                 total = 0
-                for row_index, raw in rows:
+                processing_started = time.perf_counter()
+                for common, item, problems, full_hash, input_hash, protected_group, keys, encoded in checked_rows(
+                    rows, source, original_split, config["batch_size"], executor, workers
+                ):
                     total += 1
-                    item = adapt_row(raw, source)
-                    labeled = original_split not in source.get("unlabeled_splits", [])
-                    row_id = digest(f"{source['repo_id']}@{source['revision']}:{source['config']}:{original_split}:{row_index}")
-                    source_name = item["source"] if isinstance(item["source"], str) else "unknown"
-                    task = item["task"] if isinstance(item["task"], str) else "unknown"
-                    common = {"id": row_id, "dataset": source["name"], "revision": source["revision"],
-                              "source": source_name, "task": task, "original_split": original_split,
-                              "split": "validation" if original_split == "dev" else original_split,
-                              "row_index": row_index, "is_labeled": labeled}
-                    # A bad gold target must not erase an official evaluation boundary.
-                    if source["preserve_splits"] and original_split != "train":
-                        if isinstance(item["messages"], list) and isinstance(item["tools"], list):
-                            try:
-                                _, protected_group = fingerprints(item["messages"], item["tools"])
-                                assign_split(connection, protected_group, source, original_split, config)
-                            except (ValueError, TypeError):
-                                pass
-                    problems = validate_example(item["messages"], item["tools"], allow_missing_target=not labeled)
-                    if source_name == "unknown" or task == "unknown":
-                        problems.append("missing_source_or_task")
-                    if "missing_candidate_tools" in item["adapter_notes"]:
-                        problems.append("missing_candidate_tools")
+                    row_id, labeled = common["id"], common["is_labeled"]
+                    source_name, task = common["source"], common["task"]
+                    if protected_group is not None:
+                        assign_split(connection, protected_group, source, original_split, config)
                     decision, duplicate_of, matches = "quarantine", None, []
-                    full_hash = input_hash = None
                     if not problems:
-                        full_hash, input_hash = fingerprints(item["messages"], item["tools"])
                         common["split"], protected = assign_split(connection, input_hash, source, original_split, config)
-                        matches = sorted({name for text in benchmark_texts(item["messages"])
+                        matches = sorted({name for key in keys
                                           for (name,) in connection.execute(
-                                              "SELECT name FROM benchmarks WHERE hash=?", (benchmark_key(text),))})
+                                              "SELECT name FROM benchmarks WHERE hash=?", (key,))}) if has_benchmarks else []
                         official_eval = source["preserve_splits"] and original_split != "train"
                         previous = connection.execute("SELECT id FROM examples WHERE hash=?", (full_hash,)).fetchone()
                         if protected:
@@ -497,9 +576,7 @@ def run(config, config_path, mode, root, limit=None, selected=None):
                         else:
                             decision = "keep" if labeled else "holdout"
                             connection.execute("INSERT OR IGNORE INTO examples VALUES (?, ?)", (full_hash, row_id))
-                            candidate = {**common, "example_hash": full_hash, "input_hash": input_hash,
-                                         "messages_json": json_text(item["messages"]), "tools_json": json_text(item["tools"]),
-                                         "metadata_json": json_text(item["metadata"])}
+                            candidate = {**common, "example_hash": full_hash, "input_hash": input_hash, **encoded}
                             (candidate_sink if labeled else holdout_sink).append(candidate)
                     decision_sink.append({**common, "decision": decision, "reasons_json": json_text(problems),
                                           "adapter_notes_json": json_text(item["adapter_notes"]),
@@ -526,12 +603,17 @@ def run(config, config_path, mode, root, limit=None, selected=None):
                     if total % config["batch_size"] == 0:
                         connection.commit()
                     if total % 10000 == 0:
-                        print(f"  inspected {total:,} rows", flush=True)
+                        rate = total / max(time.perf_counter() - processing_started, 0.001)
+                        print(f"  inspected {total:,} rows ({rate:,.0f} rows/s)", flush=True)
                 expected = source["splits"][original_split] if mode == "prepare" else min(limit or config["audit_rows"], source["splits"][original_split])
                 if total != expected:
                     raise ValueError(f"{source['name']}/{original_split}: expected {expected:,} rows, read {total:,}.")
                 split_counts[f"{source['name']}/{original_split}"] = total
                 connection.commit()
+                seconds = time.perf_counter() - processing_started
+                manifest["timings"]["processing"][f"{source['name']}/{original_split}"] = {
+                    "seconds": round(seconds, 3), "rows_per_second": round(total / max(seconds, 0.001), 1)
+                }
             for sink in sinks:
                 sink.close()
             sinks_closed = True
@@ -554,6 +636,7 @@ def run(config, config_path, mode, root, limit=None, selected=None):
         manifest.update(status="failed", error=str(error), counts=dict(counts), inspected_by_split=split_counts)
         raise
     finally:
+        manifest["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         manifest_path.write_text(json_text(manifest) + "\n", encoding="utf-8")
     print(f"Done: {dict(counts)}\nReport: {report_dir / 'audit.md'}\nData: {output}", flush=True)
     return output, report_dir
@@ -565,11 +648,13 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("configs/data.yaml"))
     parser.add_argument("--limit", type=int, help="Audit rows per dataset split; never used for prepare")
     parser.add_argument("--dataset", help="Select one configured dataset, e.g. mix or aisa")
+    parser.add_argument("--workers", type=int, default=1, help="Prepare worker processes (default: 1); try 4 on a multi-core VM")
     parser.add_argument("--output", type=Path, default=Path.cwd(), help="Root for data/ and reports/")
     args = parser.parse_args()
     try:
         config_path = args.config.resolve()
-        run(read_config(config_path), config_path, args.mode, args.output.resolve(), args.limit, args.dataset)
+        run(read_config(config_path), config_path, args.mode, args.output.resolve(), args.limit, args.dataset,
+            workers=args.workers)
     except KeyboardInterrupt:
         print("Interrupted. Completed downloads remain cached; rerun starts a fresh processing run.", file=sys.stderr)
         raise SystemExit(130)
